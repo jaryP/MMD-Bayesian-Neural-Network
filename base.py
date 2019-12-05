@@ -1,8 +1,32 @@
+import numpy as np
+
 import torch
 import torch.nn as nn
 from torch.distributions import Normal
 from tqdm import tqdm
 import torch.nn.functional as F
+
+
+def pairwise_distances(x, y):
+    x_norm = (x**2).sum(1).view(-1, 1)
+    y_norm = (y ** 2).sum(1).view(1, -1)
+
+    dist = x_norm + y_norm - 2.0 * torch.mm(x, torch.transpose(y, 0, 1))
+    return torch.clamp(dist, 0.0, np.inf)
+
+
+def compute_kernel(x, y):
+    dim = x.size(1)
+    # d = torch.exp(- torch.mul(torch.cdist(x, y).mean(1), 1/float(dim))).mean()
+    d = torch.exp(- torch.mul(pairwise_distances(x, y).mean(1), 1/float(dim))).mean()
+    return d
+
+
+def compute_mmd(x, y):
+    x_kernel = compute_kernel(x, x)
+    y_kernel = compute_kernel(y, y)
+    xy_kernel = compute_kernel(x, y)
+    return x_kernel + y_kernel - 2 * xy_kernel
 
 
 class BayesianParameters(nn.Module):
@@ -47,15 +71,125 @@ class BayesianParameters(nn.Module):
         pass
 
 
+class BayesianLinearLayer(nn.Module):
+    def __init__(self, in_size, out_size, divergence, mu_init=None, rho_init=None, use_bias=True, prior=None):
+
+        super().__init__()
+
+        divergence = divergence.lower()
+        if divergence not in ['mmd', 'kl']:
+            raise ValueError('type parameter should be mmd or bbb.')
+
+        self.divergence = divergence
+
+        self.w = BayesianParameters(size=(out_size, in_size),
+                                    mu_initialization=mu_init, rho_initialization=rho_init)
+
+        self.b = None
+        if use_bias:
+            self.b = BayesianParameters(size=out_size,
+                                        mu_initialization=mu_init, rho_initialization=rho_init)
+
+        self.w_w = None
+        self.b_w = None
+
+        self.prior_w = prior
+        self.prior_b = prior
+        self.log_prior = None
+        self.log_posterior = None
+
+    def _mmd_forward(self, x):
+        w = self.w.weights
+
+        b = None
+        mmd_w = torch.tensor(0).float()
+        mmd_b = torch.tensor(0).float()
+
+        if self.training:
+            mmd_w = compute_mmd(w, self.prior_w.sample(w.size()).to(w.device))
+
+            if self.b is not None:
+                b = self.b.weights.unsqueeze(0)
+                mmd_b = compute_mmd(b, self.prior_b.sample(b.size()).to(b.device))
+
+        o = F.linear(x, w, b)
+
+        self.w_w = w
+        self.b_w = b
+
+        return o, mmd_w + mmd_b
+
+    def _kl_forward(self, x):
+        w = self.w.weights
+        log_post = self.w.posterior_log_prob(w).sum()
+        log_prior = self.prior_w.log_prob(w).sum()
+        b = None
+
+        if self.b is not None:
+            b = self.b.weights
+
+            log_post += self.b.posterior_log_prob(b).sum()
+            log_prior += self.prior_b.log_prob(b).sum()
+
+        o = F.linear(x, w, b)
+
+        self.log_prior = log_prior
+        self.log_posterior = log_post
+        self.w_w = w
+        self.b_w = b
+
+        return o, log_prior, log_post
+
+
+    @property
+    def weights(self):
+        return self.w_w, self.b_w
+
+    def set_prior(self, w=None, b=None):
+        if w is not None:
+            self.prior_w = w
+        if b is not None:
+            self.prior_b = b
+
+    def posterior(self):
+        return self.w.posterior_distribution(), self.b.posterior_distribution()
+
+    def posterior_distribution(self):
+        return self.w.posterior_distribution(), self.b.posterior_distribution()
+
+    def forward(self, x):
+        if self.divergence == 'kl':
+            return self._kl_forward(x)
+        if self.divergence == 'mmd':
+            return self._mmd_forward(x)
+        # w = self.w.weights
+        # log_post = self.w.posterior_log_prob(w).sum()
+        # log_prior = self.prior_w.log_prob(w).sum()
+        # b = None
+        #
+        # if self.b is not None:
+        #     b = self.b.weights
+        #
+        #     log_post += self.b.posterior_log_prob(b).sum()
+        #     log_prior += self.prior_b.log_prob(b).sum()
+        #
+        # o = F.linear(x, w, b)
+        #
+        # self.log_prior = log_prior
+        # self.log_posterior = log_post
+        # self.w_w = w
+        # self.b_w = b
+        #
+        # return o
+
+
+# PRIORS
 class Gaussian(object):
     def __init__(self, mu=0, sigma=5):
         self.mu = mu
         self.sigma = sigma
         self.inner_gaussian = Normal(mu, sigma)
         # self.gaussian = torch.distributions.Normal(mu, sigma)
-
-    # def log_prob(self, w):
-    #     return self.gaussian.log_prob(w).sum()
 
     def sample(self, size):
         return self.inner_gaussian.rsample(size)
