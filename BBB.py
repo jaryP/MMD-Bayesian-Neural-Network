@@ -1,71 +1,11 @@
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
-from torchvision import datasets, transforms
 import numpy as np
 from tqdm import tqdm
 
-from base import BayesianParameters, Gaussian, ScaledMixtureGaussian
+from base import BayesianLinearLayer
 import torch
-
-
-class BayesianLinearLayer(nn.Module):
-    def __init__(self, in_size, out_size, mu_init=None, rho_init=None, use_bias=True, prior=None):
-
-        super().__init__()
-
-        self.w = BayesianParameters(size=(out_size, in_size),
-                                    mu_initialization=mu_init, rho_initialization=rho_init)
-
-        self.b = None
-        if use_bias:
-            self.b = BayesianParameters(size=out_size,
-                                        mu_initialization=mu_init, rho_initialization=rho_init)
-
-        self.w_w = None
-        self.b_w = None
-
-        self.prior_w = prior
-        self.prior_b = prior
-        self.log_prior = None
-        self.log_posterior = None
-
-    @property
-    def weights(self):
-        return self.w_w, self.b_w
-
-    def set_prior(self, w=None, b=None):
-        if w is not None:
-            self.prior_w = w
-        if b is not None:
-            self.prior_b = b
-
-    def posterior(self):
-        return self.w.posterior_distribution(), self.b.posterior_distribution()
-
-    def posterior_distribution(self):
-        return self.w.posterior_distribution(), self.b.posterior_distribution()
-
-    def forward(self, x):
-        w = self.w.weights
-        log_post = self.w.posterior_log_prob(w).sum()
-        log_prior = self.prior_w.log_prob(w).sum()
-        b = None
-
-        if self.b is not None:
-            b = self.b.weights
-
-            log_post += self.b.posterior_log_prob(b).sum()
-            log_prior += self.prior_b.log_prob(b).sum()
-
-        o = F.linear(x, w, b)
-
-        self.log_prior = log_prior
-        self.log_posterior = log_post
-        self.w_w = w
-        self.b_w = b
-
-        return o
 
 
 class BBB(nn.Module):
@@ -92,49 +32,38 @@ class BBB(nn.Module):
 
         for i in topology:
             self.features.append(
-                BayesianLinearLayer(in_size=prev, out_size=i, mu_init=mu_init,
+                BayesianLinearLayer(in_size=prev, out_size=i, mu_init=mu_init, divergence='kl',
                                     rho_init=rho_init, prior=self._prior))
             prev = i
 
         self.classificator = nn.ModuleList(
-            [BayesianLinearLayer(in_size=prev, out_size=classes, mu_init=mu_init, rho_init=rho_init,
+            [BayesianLinearLayer(in_size=prev, out_size=classes, mu_init=mu_init, rho_init=rho_init, divergence='kl',
                                  prior=self._prior)])
 
-    def prior(self):
-        p = 0
+    def forward(self, x):
+
+        tot_prior = 0
+        tot_post = 0
         for i in self.features:
-            p += i.log_prior
+            x, prior, post = i(x)
+            tot_post += post
+            tot_prior += prior
+            x = torch.relu(x)
 
         for i in self.classificator:
-            p += i.log_prior
+            x, prior, post = i(x)
+            tot_post += post
+            tot_prior += prior
 
-        return p
+        return x, tot_prior, tot_post
 
-    def posterior(self):
-        p = 0
-        for i in self.features:
-            p += i.log_posterior
-        for i in self.classificator:
-            p += i.log_posterior
-        return p
-
-    def forward(self, x, sample=1, task=None):
-
-        for i in self.features:
-            x = torch.relu(i(x))
-
-        for i in self.classificator:
-            x = i(x)
-
-        return x, self.prior(), self.posterior()
-
-    def sample_forward(self, x, samples=1, task=None):
+    def sample_forward(self, x, samples=1):
         o = []
         log_priors = []
         log_posts = []
 
         for i in range(samples):
-            op, prior, post = self(x, task=task)
+            op, prior, post = self(x)
             o.append(op)
             log_priors.append(prior)
             log_posts.append(post)
@@ -147,43 +76,6 @@ class BBB(nn.Module):
         log_prior = log_priors.mean()
         log_post = log_posts.mean()
         return o, log_prior, log_post
-
-
-# def epoch(model, optimizer, train_dataset, test_dataset, train_samples, test_samples, device, **kwargs):
-#     losses = []
-#
-#     M = len(train_dataset)
-#     a = np.asarray([2 ** (M - i - 1) for i in range(M + 1)])
-#     b = 2 ** M - 1
-#
-#     pi = a / b
-#
-#     model.train()
-#     for batch, (x_train, y_train) in enumerate(train_dataset):
-#         optimizer.zero_grad()
-#
-#         out, prior, post = model.sample_forward(x_train.to(device), samples=train_samples)
-#         out = out.mean(0)
-#         loss = (- post - prior) * pi[batch]
-#         loss += F.cross_entropy(out, y_train.to(device))
-#         losses.append(loss.item())
-#         loss.backward()
-#         optimizer.step()
-#
-#     preds = []
-#     true_val = []
-#
-#     model.eval()
-#     with torch.no_grad():
-#         for i, (x_test, y_test) in enumerate(test_dataset):
-#             true_val.extend(y_test.tolist())
-#
-#             out, _, _ = model.sample_forward(x_test.to(device), samples=test_samples)
-#             out = out.mean(0)
-#             out = out.argmax(dim=-1)
-#             preds.extend(out.tolist())
-#
-#     return losses, preds, true_val
 
 
 def epoch(model, optimizer, train_dataset, test_dataset, train_samples, test_samples, device, weights, **kwargs):
@@ -240,105 +132,3 @@ def epoch(model, optimizer, train_dataset, test_dataset, train_samples, test_sam
 
     return losses, (train_true, train_pred), (test_true, test_pred)
 
-
-# def trainer(epochs, model, train_dataset, test_dataset):
-#     for epoch in range(epochs):
-#         print(epoch)
-#         for batch, (x_train, y_train) in enumerate(train_dataset):
-#             optimizer.zero_grad()
-#
-#             out, prior, post = model.sample_forward(x_train, samples=1)
-#             out = out.mean(0)
-#
-#             loss = (- post - prior) * pi[batch]
-#
-#             loss += F.cross_entropy(out, y_train)
-#
-#             loss.backward()
-#             optimizer.step()
-#
-#         # learning_rate /= 1.1
-#         test_losses, test_accs = [], []
-#         for i, (x_test, y_test) in enumerate(test_dataset):
-#             optimizer.zero_grad()
-#             out, prior, post = model.sample_forward(x_test, samples=5)
-#             out = out.mean(0)
-#             # loss = F.cross_entropy(pred, y_test)
-#             acc = (out.argmax(dim=-1) == y_test).to(torch.float32).mean()
-#             # test_losses.append(loss.item())
-#             test_accs.append(acc.mean().item())
-#
-#         print('Accuracy: {}'.format(np.mean(test_accs)))
-#     print('Finished Training')
-#
-# if __name__ == '__main__':
-#
-#     import numpy as np
-#     import torch
-#     from torch import optim, nn
-#
-#     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-#
-#     n_epochs = 3
-#     batch_size_train = 128
-#     batch_size_test = 1000
-#     learning_rate = 0.001
-#     momentum = 0.5
-#     log_interval = 10
-#     input_size = 784  # The image size = 28 x 28 = 784
-#
-#     train_loader = torch.utils.data.DataLoader(
-#         datasets.MNIST('data', train=True, download=True,
-#                        transform=transforms.Compose([
-#                            transforms.ToTensor(),
-#                            # transforms.Normalize((0,), (1,)),
-#                            torch.flatten
-#                        ])), batch_size=batch_size_train, shuffle=True)
-#
-#     test_loader = torch.utils.data.DataLoader(
-#         datasets.MNIST('data', train=False, transform=transforms.Compose([
-#             transforms.ToTensor(),
-#             # transforms.Normalize((0,), (1,)),
-#             torch.flatten
-#         ])), batch_size=batch_size_test, shuffle=True)
-#
-#     model = BBB(input_size=input_size, classes=10,
-#                 device=device, prior=ScaledMixtureGaussian(0.5, np.exp(0), np.exp(-6)))
-#     epochs = 10
-#
-#     optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
-#
-#     M = len(train_loader)
-#     a = np.asarray([2 ** (M - i - 1) for i in range(M + 1)])
-#     b = np.asarray([2 ** M - 1 for i in range(M + 1)])
-#
-#     pi = a / b
-#
-#     for epoch in range(epochs):
-#         print(epoch)
-#         for batch, (x_train, y_train) in enumerate(train_loader):
-#             optimizer.zero_grad()
-#
-#             out, prior, post = model.sample_forward(x_train, samples=1)
-#             out = out.mean(0)
-#
-#             loss = (- post - prior) * pi[batch]
-#
-#             loss += F.cross_entropy(out, y_train)
-#
-#             loss.backward()
-#             optimizer.step()
-#
-#         # learning_rate /= 1.1
-#         test_losses, test_accs = [], []
-#         for i, (x_test, y_test) in enumerate(test_loader):
-#             optimizer.zero_grad()
-#             out, prior, post = model.sample_forward(x_test, samples=5)
-#             out = out.mean(0)
-#             # loss = F.cross_entropy(pred, y_test)
-#             acc = (out.argmax(dim=-1) == y_test).to(torch.float32).mean()
-#             # test_losses.append(loss.item())
-#             test_accs.append(acc.mean().item())
-#
-#         print('Accuracy: {}'.format(np.mean(test_accs)))
-#     print('Finished Training')
