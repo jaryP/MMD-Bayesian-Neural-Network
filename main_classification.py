@@ -1,5 +1,6 @@
 from itertools import chain
 
+import ANN
 import base
 # from BMMD import pairwise_distances
 from base import ScaledMixtureGaussian, Gaussian
@@ -138,13 +139,13 @@ def main(experiments):
         else:
             if network == 'mmd':
                 base_model = BMMD.BMMD
-                train_step = BMMD.epoch
+                trainer = BMMD.Trainer
             elif network == 'bbb':
                 base_model = BBB.BBB
-                train_step = BBB.epoch
+                trainer = BBB.Trainer
             elif network == 'normal':
-                base_model = base.ANN
-                train_step = base.epoch
+                base_model = ANN.ANN
+                trainer = ANN.Trainer
 
         if optimizer not in list(map(str, Optimizers)):
             raise ValueError('Supported optimizers', list(Optimizers))
@@ -193,14 +194,20 @@ def main(experiments):
             progress_bar = tqdm.tqdm(range(epoch_start, epochs), initial=epoch_start, total=epochs)
             progress_bar.set_postfix(f1_test=f1, f1_train=f1_train)
 
+            t = trainer(model, train_loader, test_loader, opt)
+
             for i in progress_bar:
 
-                loss, (train_true, train_pred), (test_true, test_pred) = train_step(model=model, optimizer=opt,
-                                                                                    train_dataset=train_loader,
-                                                                                    test_dataset=test_loader,
-                                                                                    train_samples=train_samples,
-                                                                                    test_samples=test_samples,
-                                                                                    device=device, weights=loss_weights)
+                # loss, (train_true, train_pred), (test_true, test_pred) = train_step(model=model, optimizer=opt,
+                #                                                                     train_dataset=train_loader,
+                #                                                                     test_dataset=test_loader,
+                #                                                                     train_samples=train_samples,
+                #                                                                     test_samples=test_samples,
+                #                                                                     device=device,
+                # weights=loss_weights)
+
+                loss, (train_true, train_pred), (test_true, test_pred) = t.train_step(train_samples=train_samples,
+                                                                                      test_samples=test_samples)
                 loss = np.mean(loss)
 
                 f1 = metrics.f1_score(test_true, test_pred, average='micro')
@@ -228,6 +235,7 @@ def main(experiments):
                     torch.save(results, results_path)
 
             run_results.append(results)
+            progress_bar.close()
 
         print('-' * 200)
         experiments_results.append(run_results)

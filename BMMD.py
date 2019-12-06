@@ -1,10 +1,12 @@
+from itertools import chain
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
 from tqdm import tqdm
 
-from base import BayesianLinearLayer
+from base import BayesianLinearLayer, Network, Gaussian, Wrapper
 
 
 # def euclidean_dist( x, y):
@@ -65,7 +67,7 @@ from base import BayesianLinearLayer
 #     return x_kernel + y_kernel - 2 * xy_kernel
 
 
-class BMMD(nn.Module):
+class BMMD(Network):
 
     def __init__(self, input_size, classes, topology=None, prior=None, mu_init=None, rho_init=None,
                  local_trick=False, **kwargs):
@@ -81,7 +83,7 @@ class BMMD(nn.Module):
             topology = [400, 400]
 
         if prior is None:
-            prior = Normal(0, 10)
+            prior = Gaussian(0, 10)
 
         self.features = torch.nn.ModuleList()
         self._prior = prior
@@ -98,13 +100,11 @@ class BMMD(nn.Module):
             [BayesianLinearLayer(in_size=prev, out_size=classes, mu_init=mu_init, rho_init=rho_init,
                                  prior=self._prior, divergence='mmd', local_rep_trick=local_trick)])
 
-    def forward(self, x, sample=1):
+    def _forward(self, x):
 
         mmd = 0
         for j, i in enumerate(self.features):
             x, m = i(x)
-            # print(x.size())
-
             mmd += m
             x = torch.relu(x)
 
@@ -114,12 +114,12 @@ class BMMD(nn.Module):
 
         return x, mmd
 
-    def sample_forward(self, x, samples=1):
+    def forward(self, x, samples=1):
         o = []
         mmds = []
 
         for i in range(samples):
-            op, mmd = self(x)
+            op, mmd = self._forward(x)
             o.append(op)
             mmds.append(mmd)
 
@@ -129,50 +129,158 @@ class BMMD(nn.Module):
 
         return o, mmds
 
+    def layers(self):
+        return chain(self.features, self.classificator)
 
-def epoch(model, optimizer, train_dataset, test_dataset, train_samples, test_samples, device, weights, **kwargs):
-    losses = []
+    def eval_forward(self, x, samples=1):
+        o, _ = self(x, samples=samples)
+        return o
 
-    mmd_w = weights.get('mmd', 1)
 
-    model.train()
-    progress_bar = tqdm(enumerate(train_dataset), total=len(train_dataset), disable=True)
-    # progress_bar.set_postfix(mmd_loss='not calculated', ce_loss='not calculated')
+class Trainer(Wrapper):
+    def __init__(self, model: nn.Module, train_data, test_data, optimizer):
+        super().__init__(model, train_data, test_data, optimizer)
 
-    train_true = []
-    train_pred = []
+    def train_epoch(self, samples=1, **kwargs):
+        losses = []
 
-    for batch, (x_train, y_train) in progress_bar:
-        train_true.extend(y_train.tolist())
+        self.model.train()
+        progress_bar = tqdm(enumerate(self.train_data), total=len(self.train_data), disable=True)
+        # progress_bar.set_postfix(mmd_loss='not calculated', ce_loss='not calculated')
 
-        optimizer.zero_grad()
+        train_true = []
+        train_pred = []
 
-        out, mmd = model.sample_forward(x_train.to(device), samples=train_samples)
-        out = out.mean(0)
-        mmd = (mmd * mmd_w)
+        for batch, (x_train, y_train) in progress_bar:
+            train_true.extend(y_train.tolist())
 
-        max_class = F.log_softmax(out, -1).argmax(dim=-1)
-        train_pred.extend(max_class.tolist())
+            self.optimizer.zero_grad()
 
-        ce = F.nll_loss(F.log_softmax(out, -1), y_train.to(device))
-        loss = ce + mmd
-        losses.append(loss.item())
-        loss.backward()
-        optimizer.step()
-
-        progress_bar.set_postfix(mmd_loss=mmd.item(), ce_loss=ce.item())
-
-    test_pred = []
-    test_true = []
-
-    model.eval()
-    with torch.no_grad():
-        for i, (x_test, y_test) in enumerate(test_dataset):
-            test_true.extend(y_test.tolist())
-
-            out, mmd = model.sample_forward(x_test.to(device), samples=test_samples)
+            out, mmd = self.model(x_train.to(self.device), samples=samples)
             out = out.mean(0)
-            out = out.argmax(dim=-1)
-            test_pred.extend(out.tolist())
 
-    return losses, (train_true, train_pred), (test_true, test_pred)
+            max_class = F.log_softmax(out, -1).argmax(dim=-1)
+            train_pred.extend(max_class.tolist())
+
+            ce = F.nll_loss(F.log_softmax(out, -1), y_train.to(self.device))
+            loss = ce + mmd
+            losses.append(loss.item())
+            loss.backward()
+            self.optimizer.step()
+
+            # progress_bar.set_postfix(ce_loss=loss.item())
+
+        return losses, (train_true, train_pred)
+
+    def test_evaluation(self, samples, **kwargs):
+
+        test_pred = []
+        test_true = []
+
+        self.model.eval()
+        with torch.no_grad():
+            for i, (x_test, y_test) in enumerate(self.test_data):
+                test_true.extend(y_test.tolist())
+
+                out = self.model.eval_forward(x_test.to(self.device), samples=samples)
+                out = out.mean(0)
+                out = out.argmax(dim=-1)
+                test_pred.extend(out.tolist())
+
+        return test_true, test_pred
+
+    def train_step(self, train_samples=1, test_samples=1, **kwargs):
+        losses, train_res = self.train_epoch(samples=train_samples)
+        test_res = self.test_evaluation(samples=test_samples)
+        return losses, train_res, test_res
+
+    def snr_test(self, percentiles: list):
+        return None
+
+
+# def epoch(model, optimizer, train_dataset, test_dataset, train_samples, test_samples, device, weights, **kwargs):
+#     losses = []
+#
+#     mmd_w = weights.get('mmd', 1)
+#
+#     model.train()
+#     progress_bar = tqdm(enumerate(train_dataset), total=len(train_dataset), disable=True)
+#     # progress_bar.set_postfix(mmd_loss='not calculated', ce_loss='not calculated')
+#
+#     train_true = []
+#     train_pred = []
+#
+#     for batch, (x_train, y_train) in progress_bar:
+#         train_true.extend(y_train.tolist())
+#
+#         optimizer.zero_grad()
+#
+#         out, mmd = model.sample_forward(x_train.to(device), samples=train_samples)
+#         out = out.mean(0)
+#         mmd = (mmd * mmd_w)
+#
+#         max_class = F.log_softmax(out, -1).argmax(dim=-1)
+#         train_pred.extend(max_class.tolist())
+#
+#         ce = F.nll_loss(F.log_softmax(out, -1), y_train.to(device))
+#         loss = ce + mmd
+#         losses.append(loss.item())
+#         loss.backward()
+#         optimizer.step()
+#
+#         progress_bar.set_postfix(mmd_loss=mmd.item(), ce_loss=ce.item())
+#
+#     test_pred = []
+#     test_true = []
+#
+#     model.eval()
+#     with torch.no_grad():
+#         for i, (x_test, y_test) in enumerate(test_dataset):
+#             test_true.extend(y_test.tolist())
+#
+#             out, mmd = model.sample_forward(x_test.to(device), samples=test_samples)
+#             out = out.mean(0)
+#             out = out.argmax(dim=-1)
+#             test_pred.extend(out.tolist())
+#
+#     return losses, (train_true, train_pred), (test_true, test_pred)
+
+
+if __name__ == '__main__':
+    from itertools import chain
+
+    import torch
+    from sklearn import metrics
+    from torch import nn
+    from torchvision.transforms import transforms
+    from torchvision import datasets
+    from tqdm import tqdm
+
+    image_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,)),
+        # transforms.Normalize((0,), (1,)),
+        torch.flatten
+    ])
+
+    train_split = datasets.MNIST('./Datasets/MNIST', train=True, download=True,
+                                 transform=image_transform)
+
+    train_loader = torch.utils.data.DataLoader(train_split, batch_size=100, shuffle=True)
+
+    test_loader = torch.utils.data.DataLoader(
+        datasets.MNIST('./Datasets/MNIST', train=False, transform=image_transform), batch_size=1000,
+        shuffle=False)
+
+    input_size = 784
+    classes = 10
+
+    ann = BMMD(784, 10, local_trick=True)
+    ann.cuda()
+    trainer = Trainer(ann, train_loader, test_loader, torch.optim.Adam(ann.parameters(), 1e-3))
+
+    for i in range(10):
+       a, _, (test_true, test_pred) = trainer.train_step(test_samples=2, train_samples=2)
+       f1 = metrics.f1_score(test_true, test_pred, average='micro')
+
+       print(f1)
