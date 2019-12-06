@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 
 def pairwise_distances(x, y):
-    x_norm = (x**2).sum(1).view(-1, 1)
+    x_norm = (x ** 2).sum(1).view(-1, 1)
     y_norm = (y ** 2).sum(1).view(1, -1)
 
     dist = x_norm + y_norm - 2.0 * torch.mm(x, torch.transpose(y, 0, 1))
@@ -18,7 +18,7 @@ def pairwise_distances(x, y):
 def compute_kernel(x, y):
     dim = x.size(1)
     # d = torch.exp(- torch.mul(torch.cdist(x, y).mean(1), 1/float(dim))).mean()
-    d = torch.exp(- torch.mul(pairwise_distances(x, y).mean(1), 1/float(dim))).mean()
+    d = torch.exp(- torch.mul(pairwise_distances(x, y).mean(1), 1 / float(dim))).mean()
     return d
 
 
@@ -53,7 +53,12 @@ class BayesianParameters(nn.Module):
 
     @property
     def weights(self):
-        return self.mu + torch.log(1 + torch.exp(self.rho)) * Normal(0, 1).sample(self.mu.shape).to(self.mu.device)
+        return self.mu + torch.log(1 + torch.exp(self.rho)) * torch.randn(self.mu.shape, requires_grad=True).to(
+            self.mu.device)  # Normal(0, 1).sample(self.mu.shape).to(self.mu.device)
+
+    @property
+    def sigma(self):
+        return torch.log(1 + torch.exp(self.rho))
 
     def prior(self, prior: torch.distributions, w, log=True):
         if log:
@@ -72,13 +77,16 @@ class BayesianParameters(nn.Module):
 
 
 class BayesianLinearLayer(nn.Module):
-    def __init__(self, in_size, out_size, divergence, mu_init=None, rho_init=None, use_bias=True, prior=None):
+    def __init__(self, in_size, out_size, divergence, mu_init=None, rho_init=None, use_bias=True, prior=None,
+                 local_rep_trick=False):
 
         super().__init__()
 
         divergence = divergence.lower()
         if divergence not in ['mmd', 'kl']:
             raise ValueError('type parameter should be mmd or bbb.')
+
+        self.local_trick = local_rep_trick
 
         self.divergence = divergence
 
@@ -98,48 +106,113 @@ class BayesianLinearLayer(nn.Module):
         self.log_prior = None
         self.log_posterior = None
 
-    def _mmd_forward(self, x):
-        w = self.w.weights
-
+    def _forward(self, x):
         b = None
-        mmd_w = torch.tensor(0).float()
-        mmd_b = torch.tensor(0).float()
+        if not self.local_trick:
+            w = self.w.weights
+            if self.b is not None:
+                b = self.b.weights
+            o = F.linear(x, w, b)
+            return o, w, b
+        else:
+            sigma_w = self.w.sigma
+            w_mu = torch.mm(x, self.w.mu.t())
+            w_std = torch.sqrt(torch.mm(x.pow(2), sigma_w.pow(2).t()))
+
+            w_out = w_mu + w_std * torch.randn(w_mu.shape, requires_grad=True).to(x.device)
+
+            if self.b is not None:
+                b = self.b.weights
+                w_out += b.unsqueeze(0).expand(x.shape[0], -1)
+                # torch.randn(w_mu.shape, requires_grad=True).to(self.mu.device)
+
+            return w_out, self.w.weights, b
+
+    def _mmd_forward(self, x):
+        o, w, b = self._forward(x)
+
+        mmd_w = torch.tensor(0.0)#.float()
+        mmd_b = torch.tensor(0.0)#.float()
 
         if self.training:
             mmd_w = compute_mmd(w, self.prior_w.sample(w.size()).to(w.device))
 
-            if self.b is not None:
-                b = self.b.weights.unsqueeze(0)
+            if b is not None:
+                b = b.unsqueeze(0)
                 mmd_b = compute_mmd(b, self.prior_b.sample(b.size()).to(b.device))
 
-        o = F.linear(x, w, b)
-
-        self.w_w = w
-        self.b_w = b
+        # o = F.linear(x, w, b)
+        #
+        # self.w_w = w
+        # self.b_w = b
 
         return o, mmd_w + mmd_b
 
     def _kl_forward(self, x):
-        w = self.w.weights
-        log_post = self.w.posterior_log_prob(w).sum()
-        log_prior = self.prior_w.log_prob(w).sum()
-        b = None
+        # w = self.w.weights
+        o, w, b = self._forward(x)
+        log_post = torch.tensor(0.0)
+        log_prior = torch.tensor(0.0)
 
-        if self.b is not None:
-            b = self.b.weights
+        if self.training:
+            log_post = self.w.posterior_log_prob(w).sum()
+            log_prior = self.prior_w.log_prob(w).sum()
+            # b = None
 
-            log_post += self.b.posterior_log_prob(b).sum()
-            log_prior += self.prior_b.log_prob(b).sum()
+            if b is not None:
+                log_post += self.b.posterior_log_prob(b).sum()
+                log_prior += self.prior_b.log_prob(b).sum()
 
-        o = F.linear(x, w, b)
-
-        self.log_prior = log_prior
-        self.log_posterior = log_post
-        self.w_w = w
-        self.b_w = b
+        # o = F.linear(x, w, b)
+        #
+        # self.log_prior = log_prior
+        # self.log_posterior = log_post
+        # self.w_w = w
+        # self.b_w = b
 
         return o, log_prior, log_post
 
+    # def _mmd_forward(self, x):
+    #     w = self.w.weights
+    #
+    #     b = None
+    #     mmd_w = torch.tensor(0).float()
+    #     mmd_b = torch.tensor(0).float()
+    #
+    #     if self.training:
+    #         mmd_w = compute_mmd(w, self.prior_w.sample(w.size()).to(w.device))
+    #
+    #         if self.b is not None:
+    #             b = self.b.weights.unsqueeze(0)
+    #             mmd_b = compute_mmd(b, self.prior_b.sample(b.size()).to(b.device))
+    #
+    #     o = F.linear(x, w, b)
+    #
+    #     self.w_w = w
+    #     self.b_w = b
+    #
+    #     return o, mmd_w + mmd_b
+
+    # def _kl_forward(self, x):
+    #     w = self.w.weights
+    #     log_post = self.w.posterior_log_prob(w).sum()
+    #     log_prior = self.prior_w.log_prob(w).sum()
+    #     b = None
+    #
+    #     if self.b is not None:
+    #         b = self.b.weights
+    #
+    #         log_post += self.b.posterior_log_prob(b).sum()
+    #         log_prior += self.prior_b.log_prob(b).sum()
+    #
+    #     o = F.linear(x, w, b)
+    #
+    #     self.log_prior = log_prior
+    #     self.log_posterior = log_post
+    #     self.w_w = w
+    #     self.b_w = b
+    #
+    #     return o, log_prior, log_post
 
     @property
     def weights(self):
@@ -162,64 +235,6 @@ class BayesianLinearLayer(nn.Module):
             return self._kl_forward(x)
         if self.divergence == 'mmd':
             return self._mmd_forward(x)
-        # w = self.w.weights
-        # log_post = self.w.posterior_log_prob(w).sum()
-        # log_prior = self.prior_w.log_prob(w).sum()
-        # b = None
-        #
-        # if self.b is not None:
-        #     b = self.b.weights
-        #
-        #     log_post += self.b.posterior_log_prob(b).sum()
-        #     log_prior += self.prior_b.log_prob(b).sum()
-        #
-        # o = F.linear(x, w, b)
-        #
-        # self.log_prior = log_prior
-        # self.log_posterior = log_post
-        # self.w_w = w
-        # self.b_w = b
-        #
-        # return o
-
-
-# PRIORS
-class Gaussian(object):
-    def __init__(self, mu=0, sigma=5):
-        self.mu = mu
-        self.sigma = sigma
-        self.inner_gaussian = Normal(mu, sigma)
-        # self.gaussian = torch.distributions.Normal(mu, sigma)
-
-    def sample(self, size):
-        return self.inner_gaussian.rsample(size)
-        # return self.mu + self.sigma * Normal(0, 1).sample(size)
-
-    def log_prob(self, x):
-        return self.inner_gaussian.log_prob(x)
-
-    def prob(self, x):
-        return self.inner_gaussian.prob(x)
-
-
-class ScaledMixtureGaussian(object):
-    def __init__(self, pi, s1, s2, mu1=0, mu2=0):
-        self.pi = pi
-        self.s1 = s1
-        self.s2 = s2
-        self.mu1 = mu1
-        self.mu2 = mu2
-        self.gaussian1 = Gaussian(mu1, s1)
-        self.gaussian2 = Gaussian(mu2, s2)
-
-    def sample(self, size):
-        return self.pi * self.gaussian1.sample(size) + (1-self.pi)*self.gaussian2.sample(size)
-
-    def log_prob(self, x):
-        return self.pi * self.gaussian1.log_prob(x) + (1-self.pi)*self.gaussian2.log_prob(x)
-
-    def prob(self, x):
-        return self.pi * self.gaussian1.prob(x) + (1-self.pi)*self.gaussian2.prob(x)
 
 
 class ANN(nn.Module):
@@ -269,6 +284,45 @@ class ANN(nn.Module):
     #     mmds = torch.stack(mmds).mean()
     #
     #     return o, mmds
+
+
+# PRIORS
+class Gaussian(object):
+    def __init__(self, mu=0, sigma=5):
+        self.mu = mu
+        self.sigma = sigma
+        self.inner_gaussian = Normal(mu, sigma)
+        # self.gaussian = torch.distributions.Normal(mu, sigma)
+
+    def sample(self, size):
+        return self.inner_gaussian.rsample(size)
+        # return self.mu + self.sigma * Normal(0, 1).sample(size)
+
+    def log_prob(self, x):
+        return self.inner_gaussian.log_prob(x)
+
+    def prob(self, x):
+        return self.inner_gaussian.prob(x)
+
+
+class ScaledMixtureGaussian(object):
+    def __init__(self, pi, s1, s2, mu1=0, mu2=0):
+        self.pi = pi
+        self.s1 = s1
+        self.s2 = s2
+        self.mu1 = mu1
+        self.mu2 = mu2
+        self.gaussian1 = Gaussian(mu1, s1)
+        self.gaussian2 = Gaussian(mu2, s2)
+
+    def sample(self, size):
+        return self.pi * self.gaussian1.sample(size) + (1 - self.pi) * self.gaussian2.sample(size)
+
+    def log_prob(self, x):
+        return self.pi * self.gaussian1.log_prob(x) + (1 - self.pi) * self.gaussian2.log_prob(x)
+
+    def prob(self, x):
+        return self.pi * self.gaussian1.prob(x) + (1 - self.pi) * self.gaussian2.prob(x)
 
 
 def epoch(model, optimizer, train_dataset, test_dataset, device, **kwargs):

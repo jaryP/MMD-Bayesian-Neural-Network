@@ -13,8 +13,8 @@ def get_dataset(name, batch_size, dev_split):
     if name == "fMNIST":
         image_transform = transforms.Compose([
             transforms.ToTensor(),
-            # transforms.Normalize((0.1307,), (0.3081,)),
-            transforms.Normalize((0,), (1,)),
+            transforms.Normalize((0.1307,), (0.3081,)),
+            # transforms.Normalize((0,), (1,)),
             torch.flatten
         ])
 
@@ -35,9 +35,9 @@ def get_dataset(name, batch_size, dev_split):
             train_loader = torch.utils.data.DataLoader(train_split, batch_size=batch_size, shuffle=True)
 
             test_loader = torch.utils.data.DataLoader(
-                datasets.MNIST('./MNIST', train=False, transform=image_transform), batch_size=1000,
+                datasets.MNIST('./Datasets/MNIST', train=False, transform=image_transform), batch_size=1000,
                 shuffle=False)
-
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            
         input_size = 784
         classes = 10
         return input_size, classes, train_loader, test_loader
@@ -97,8 +97,8 @@ def main(experiments):
             prior = Gaussian(mu, sigma)
 
         # Parameters of the experiments
-        batch_size = data['batch_size']
-        lr = data['lr']
+        batch_size = data.get('batch_size', 64)
+        lr = data.get('lr', 1e-3)
         topology = data['topology']
         weights_mu_init = data['weights_mu_init']
         weights_rho_init = data['weights_rho_init']
@@ -107,16 +107,17 @@ def main(experiments):
         network = data["network_type"].lower()
         experiments = data.get('experiments', 1)
         seeds = data.get('experiments_seeds', 0)
-        device = 'cuda' if torch.cuda.is_available() and data['use_cuda'] else 'cpu'
+        device = 'cuda' if torch.cuda.is_available() and data.get('use_cuda', True) else 'cpu'
         save_path = data['save_path']
         loss_weights = data['loss_weights']
         epochs = data['epochs']
-        train_samples = data['train_samples']
-        test_samples = data['test_samples']
+        train_samples = data.get('train_samples', 2)
+        test_samples = data.get('test_samples', 2)
         exp_name = data['exp_name']
         save = data['save']
         load = data['load']
-        dev_split = data['dev_split']
+        dev_split = data.get('dev_split', 0)
+        local_trick = data.get('local_trick', False)
 
         if epochs < 0:
             raise ValueError('The number of epoch should be > 0')
@@ -166,7 +167,7 @@ def main(experiments):
                 input_size, classes, train_loader, test_loader = get_dataset(dataset, batch_size, dev_split)
 
             model = base_model(input_size=input_size, prior=prior, mu_init=weights_mu_init, device=device,
-                               rho_init=weights_rho_init, topology=topology, classes=classes)
+                               rho_init=weights_rho_init, topology=topology, classes=classes, local_trick=local_trick)
             model.to(device)
             opt = optimizer(model.parameters(), lr=lr)
 
@@ -251,3 +252,15 @@ def main(experiments):
         # plt.show()
 
     return experiments_results
+
+
+if __name__ == '__main__':
+    import json
+    import sys
+
+    args = sys.argv[1:]
+
+    with open(args[0], "r") as read_file:
+        experiments = json.load(read_file)
+
+    results = main(experiments)

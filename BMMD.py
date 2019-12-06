@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch.distributions import Normal
 from tqdm import tqdm
 
-from base import  BayesianLinearLayer
+from base import BayesianLinearLayer
 
 
 # def euclidean_dist( x, y):
@@ -67,7 +67,8 @@ from base import  BayesianLinearLayer
 
 class BMMD(nn.Module):
 
-    def __init__(self, input_size, classes, topology=None, prior=None, mu_init=None, rho_init=None, **kwargs):
+    def __init__(self, input_size, classes, topology=None, prior=None, mu_init=None, rho_init=None,
+                 local_trick=False, **kwargs):
         super().__init__()
 
         if mu_init is None:
@@ -90,20 +91,22 @@ class BMMD(nn.Module):
         for i in topology:
             self.features.append(
                 BayesianLinearLayer(in_size=prev, out_size=i, mu_init=mu_init, divergence='mmd',
-                                    rho_init=rho_init, prior=self._prior))
+                                    rho_init=rho_init, prior=self._prior, local_rep_trick=local_trick))
             prev = i
 
         self.classificator = nn.ModuleList(
             [BayesianLinearLayer(in_size=prev, out_size=classes, mu_init=mu_init, rho_init=rho_init,
-                                 prior=self._prior, divergence='mmd',)])
+                                 prior=self._prior, divergence='mmd', local_rep_trick=local_trick)])
 
     def forward(self, x, sample=1):
 
         mmd = 0
         for j, i in enumerate(self.features):
-            r, m = i(x)
+            x, m = i(x)
+            # print(x.size())
+
             mmd += m
-            x = torch.relu(r)
+            x = torch.relu(x)
 
         x, m = self.classificator[0](x)
 
