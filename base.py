@@ -1,3 +1,6 @@
+from abc import ABC, abstractmethod
+from typing import Tuple
+
 import numpy as np
 
 import torch
@@ -131,8 +134,8 @@ class BayesianLinearLayer(nn.Module):
     def _mmd_forward(self, x):
         o, w, b = self._forward(x)
 
-        mmd_w = torch.tensor(0.0)#.float()
-        mmd_b = torch.tensor(0.0)#.float()
+        mmd_w = torch.tensor(0.0)  # .float()
+        mmd_b = torch.tensor(0.0)  # .float()
 
         if self.training:
             mmd_w = compute_mmd(w, self.prior_w.sample(w.size()).to(w.device))
@@ -237,55 +240,6 @@ class BayesianLinearLayer(nn.Module):
             return self._mmd_forward(x)
 
 
-class ANN(nn.Module):
-
-    def __init__(self, input_size, classes, topology=None, prior=None, **kwargs):
-        super().__init__()
-
-        if topology is None:
-            topology = [400, 400]
-
-        if prior is None:
-            prior = Normal(0, 10)
-
-        self.features = torch.nn.ModuleList()
-        self._prior = prior
-
-        prev = input_size
-
-        for i in topology:
-            self.features.append(
-                torch.nn.Linear(prev, i))
-            prev = i
-
-        self.classificator = nn.ModuleList([torch.nn.Linear(prev, classes)])
-
-    def forward(self, x, sample=1, task=None):
-
-        for j, i in enumerate(self.features):
-            r = i(x)
-            x = torch.relu(r)
-
-        x = self.classificator[0](x)
-
-        return x
-
-    # def sample_forward(self, x, samples=1, task=None):
-    #     o = []
-    #     mmds = []
-    #
-    #     for i in range(samples):
-    #         op, mmd = self(x, task=task)
-    #         o.append(op)
-    #         mmds.append(mmd)
-    #
-    #     o = torch.stack(o)
-    #
-    #     mmds = torch.stack(mmds).mean()
-    #
-    #     return o, mmds
-
-
 # PRIORS
 class Gaussian(object):
     def __init__(self, mu=0, sigma=5):
@@ -323,6 +277,45 @@ class ScaledMixtureGaussian(object):
 
     def prob(self, x):
         return self.pi * self.gaussian1.prob(x) + (1 - self.pi) * self.gaussian2.prob(x)
+
+
+# Utils
+
+class Network(nn.Module, ABC):
+
+    @abstractmethod
+    def layers(self):
+        pass
+
+    @abstractmethod
+    def eval_forward(self, x, **kwargs):
+        pass
+
+
+class Wrapper(ABC):
+    def __init__(self, model: nn.Module, train_data, test_data, optimizer):
+        self.model = model
+        self.train_data = train_data
+        self.test_data = test_data
+        self.optimizer = optimizer
+        self.device = next(model.parameters()).device
+
+    def train_step(self, **kwargs):
+        losses, train_res = self.train_epoch(**kwargs)
+        test_res = self.test_evaluation(**kwargs)
+        return losses, train_res, test_res
+
+    @abstractmethod
+    def train_epoch(self, **kwargs) -> Tuple[list, Tuple[list, list]]:
+        pass
+
+    @abstractmethod
+    def test_evaluation(self, **kwargs) -> Tuple[list, list]:
+        pass
+
+    @abstractmethod
+    def snr_test(self, percentiles: list) -> list:
+        pass
 
 
 def epoch(model, optimizer, train_dataset, test_dataset, device, **kwargs):
