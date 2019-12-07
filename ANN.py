@@ -1,18 +1,15 @@
 from itertools import chain
 
 import torch
-from sklearn import metrics
 from torch import nn
-from torchvision.transforms import transforms
-from torchvision import datasets
 from tqdm import tqdm
 
-from base import Network, Wrapper
+from base import Network, Wrapper, Flatten
 import torch.nn.functional as F
 
 
 class ANN(Network):
-    def __init__(self, input_size, classes, topology=None, **kwargs):
+    def __init__(self, input_size, classes, topology=None, ann_type='linear', input_image=None, **kwargs):
         super().__init__()
 
         if topology is None:
@@ -20,22 +17,82 @@ class ANN(Network):
 
         self.features = torch.nn.ModuleList()
 
+        # prev = input_size
+        #
+        # self.ann_type = ann_type
+        # for i in topology:
+        #     l = None
+        #     if ann_type == 'linear':
+        #         l = torch.nn.Linear(prev, i)
+        #     else:
+        #         l = torch.nn.Conv2d(in_channels=prev, out_channels=i, kernel_size=3)
+        #
+        #     self.features.append(l)
+        #     prev = i
+        #
+        # input_image = input_image.unsqueeze(0)
+        # if ann_type == 'cnn':
+        #     for f in self.features:
+        #         input_image = f(input_image)
+        #     input_image = torch.flatten(input_image)
+        #     prev = input_image.shape[0]
+        # # print(prev)
+        # self.classificator = nn.ModuleList([torch.nn.Linear(prev, classes)])
+
         prev = input_size
+        input_image = input_image.unsqueeze(0)
 
-        for i in topology:
-            self.features.append(
-                torch.nn.Linear(prev, i))
-            prev = i
+        for j, i in enumerate(topology):
 
-        self.classificator = nn.ModuleList([torch.nn.Linear(prev, classes)])
+            if isinstance(i, (tuple, list)) and i[0] == 'MP':
+                l = torch.nn.MaxPool2d(i[1])
+                input_image = l(input_image)
+                prev = input_image.shape[1]
 
-    def forward(self, x, **kwargs):
+            elif isinstance(i, (tuple, list)) and i[0] == 'AP':
+                l = torch.nn.AvgPool2d(i[1])
+                input_image = l(input_image)
+                prev = input_image.shape[1]
+
+            elif isinstance(i, (tuple, list)):
+                size, kernel_size = i
+                l = torch.nn.Conv2d(in_channels=prev, out_channels=size, kernel_size=kernel_size)
+
+                input_image = l(input_image)
+                prev = input_image.shape[1]
+
+            elif isinstance(i, int):
+                if j > 0 and not isinstance(topology[j - 1], int):
+                    input_image = torch.flatten(input_image, 1)
+                    prev = input_image.shape[-1]
+                    self.features.append(Flatten())
+
+                size = i
+                l = torch.nn.Linear(prev, i)
+                prev = size
+
+            else:
+                raise ValueError('Topology should be tuple for cnn layers, formatted as (num_kernels, kernel_size), '
+                                 'pooling layer, formatted as tuple ([\'MP\', \'AP\'], kernel_size, stride) '
+                                 'or integer, for linear layer. {} was given'.format(i))
+
+            self.features.append(l)
+
+        if isinstance(topology[-1], (tuple, list)):
+            input_image = torch.flatten(input_image, 1)
+            prev = input_image.shape[-1]
+            self.features.append(Flatten())
+
+        self.features.append(torch.nn.Linear(prev, classes))
+
+    def forward(self, x):
 
         for j, i in enumerate(self.features):
-            r = i(x)
-            x = torch.relu(r)
+            x = i(x)
 
-        x = self.classificator[0](x)
+            if j < len(self.features)-1:
+                x = torch.relu(x)
+
         return x
 
     def layers(self):
@@ -69,7 +126,7 @@ class Trainer(Wrapper):
             max_class = F.log_softmax(out, -1).argmax(dim=-1)
             train_pred.extend(max_class.tolist())
 
-            loss = F.nll_loss(F.log_softmax(out, -1), y_train.to(self.device))
+            loss = F.cross_entropy(out, y_train.to(self.device), reduction='mean')
 
             losses.append(loss.item())
             loss.backward()
@@ -98,48 +155,3 @@ class Trainer(Wrapper):
     def snr_test(self, percentiles: list):
         return None
 
-
-# def sample_forward(self, x, samples=1, task=None):
-#     o = []
-#     mmds = []
-#
-#     for i in range(samples):
-#         op, mmd = self(x, task=task)
-#         o.append(op)
-#         mmds.append(mmd)
-#
-#     o = torch.stack(o)
-#
-#     mmds = torch.stack(mmds).mean()
-#
-#     return o, mmds
-
-if __name__ == '__main__':
-    image_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,)),
-        # transforms.Normalize((0,), (1,)),
-        torch.flatten
-    ])
-
-    train_split = datasets.MNIST('./Datasets/MNIST', train=True, download=True,
-                                 transform=image_transform)
-
-    train_loader = torch.utils.data.DataLoader(train_split, batch_size=100, shuffle=True)
-
-    test_loader = torch.utils.data.DataLoader(
-        datasets.MNIST('./Datasets/MNIST', train=False, transform=image_transform), batch_size=1000,
-        shuffle=False)
-
-    input_size = 784
-    classes = 10
-
-    ann = ANN(784, 10)
-    ann.cuda()
-    trainer = Trainer(ann, train_loader, test_loader, torch.optim.Adam(ann.parameters(), 1e-3))
-
-    for i in range(10):
-       a, _, (test_true, test_pred) = trainer.train_step(cacca=20)
-       f1 = metrics.f1_score(test_true, test_pred, average='micro')
-
-       print(f1)

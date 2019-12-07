@@ -2,18 +2,17 @@ from itertools import chain
 
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Normal
 import numpy as np
 from tqdm import tqdm
 
-from base import BayesianLinearLayer, Gaussian, Network, Wrapper
+from base import BayesianLinearLayer, Gaussian, Network, Wrapper, BayesianCNNLayer, Flatten
 import torch
 
 
 class BBB(Network):
 
     def __init__(self, input_size, classes, topology=None, prior=None, mu_init=None, rho_init=None,
-                 local_trick=False, **kwargs):
+                 local_trick=False, input_image=None, **kwargs):
         super().__init__()
 
         if mu_init is None:
@@ -28,36 +27,84 @@ class BBB(Network):
         if prior is None:
             prior = Gaussian(0, 10)
 
-        self.features = nn.ModuleList()
+        self.features = torch.nn.ModuleList()
         self._prior = prior
 
         prev = input_size
+        input_image = input_image.unsqueeze(0)
 
-        for i in topology:
-            self.features.append(
-                BayesianLinearLayer(in_size=prev, out_size=i, mu_init=mu_init, divergence='kl',
-                                    rho_init=rho_init, prior=self._prior, local_rep_trick=local_trick))
-            prev = i
+        for j, i in enumerate(topology):
 
-        self.classificator = nn.ModuleList(
-            [BayesianLinearLayer(in_size=prev, out_size=classes, mu_init=mu_init, rho_init=rho_init, divergence='kl',
-                                 prior=self._prior, local_rep_trick=local_trick)])
+            if isinstance(i, (tuple, list)) and i[0] == 'MP':
+                l = torch.nn.MaxPool2d(i[1])
+                input_image = l(input_image)
+                prev = input_image.shape[1]
+
+            elif isinstance(i, (tuple, list)) and i[0] == 'AP':
+                l = torch.nn.AvgPool2d(i[1])
+                input_image = l(input_image)
+                prev = input_image.shape[1]
+
+            elif isinstance(i, (tuple, list)):
+                size, kernel_size = i
+                l = BayesianCNNLayer(in_channels=prev, kernels=size, kernel_size=kernel_size,
+                                     mu_init=mu_init, divergence='kl',
+                                     rho_init=rho_init, prior=self._prior)
+
+                input_image = l(input_image)[0]
+                prev = input_image.shape[1]
+
+            elif isinstance(i, int):
+                if j > 0 and not isinstance(topology[j-1], int):
+                    input_image = torch.flatten(input_image, 1)
+                    prev = input_image.shape[-1]
+                    self.features.append(Flatten())
+
+                size = i
+                l = BayesianLinearLayer(in_size=prev, out_size=size, mu_init=mu_init, divergence='kl',
+                                        rho_init=rho_init, prior=self._prior, local_rep_trick=local_trick)
+                prev = size
+
+            else:
+                raise ValueError('Topology should be tuple for cnn layers, formatted as (num_kernels, kernel_size), '
+                                 'pooling layer, formatted as tuple ([\'MP\', \'AP\'], kernel_size) '
+                                 'or integer, for linear layer. {} was given'.format(i))
+
+            self.features.append(l)
+
+        if isinstance(topology[-1], (tuple, list)):
+            input_image = torch.flatten(input_image, 1)
+            prev = input_image.shape[-1]
+            self.features.append(Flatten())
+
+        self.features.append(BayesianLinearLayer(in_size=prev, out_size=classes, mu_init=mu_init, rho_init=rho_init,
+                                                 prior=self._prior, divergence='kl', local_rep_trick=local_trick))
 
     def _forward(self, x):
 
         tot_prior = 0
         tot_post = 0
 
-        for i in self.features:
-            x, prior, post = i(x)
-            tot_post += post
-            tot_prior += prior
-            x = torch.relu(x)
+        for j, i in enumerate(self.features):
+            if not isinstance(i, (BayesianLinearLayer, BayesianCNNLayer)):
+                x = i(x)
+            else:
+                x, prior, post = i(x)
+                tot_post += post
+                tot_prior += prior
 
-        for i in self.classificator:
-            x, prior, post = i(x)
-            tot_post += post
-            tot_prior += prior
+            if j < len(self.features)-1:
+                x = torch.relu(x)
+
+        #     x = torch.relu(x)
+        #
+        # if self.ann_type == 'cnn':
+        #     x = torch.flatten(x, 1)
+        #
+        # for i in self.classificator:
+        #     x, prior, post = i(x)
+        #     tot_post += post
+        #     tot_prior += prior
 
         return x, tot_prior, tot_post
 
@@ -117,7 +164,7 @@ class Trainer(Wrapper):
             out = out.mean(0)
             logloss = (- post - prior) * pi[batch]  # /x_train.shape[0]
 
-            ce = F.nll_loss(F.log_softmax(out, -1), y_train.to(self.device))
+            ce = F.cross_entropy(out, y_train.to(self.device), reduction='sum')
             loss = ce + logloss
             losses.append(loss.item())
             loss.backward()
@@ -154,98 +201,3 @@ class Trainer(Wrapper):
 
     def snr_test(self, percentiles: list):
         return None
-
-
-# def epoch(model, optimizer, train_dataset, test_dataset, train_samples, test_samples, device, weights, **kwargs):
-#     losses = []
-#
-#     # mmd_w = weights.get('mmd', 1)
-#
-#     M = len(train_dataset)
-#     a = np.asarray([2 ** (M - i - 1) for i in range(M + 1)])
-#     b = 2 ** M - 1
-#
-#     pi = a / b
-#
-#     model.train()
-#     progress_bar = tqdm(enumerate(train_dataset), total=len(train_dataset), disable=True)
-#     # progress_bar.set_postfix(mmd_loss='not calculated', ce_loss='not calculated')
-#
-#     train_true = []
-#     train_pred = []
-#
-#     for batch, (x_train, y_train) in progress_bar:
-#         train_true.extend(y_train.tolist())
-#
-#         optimizer.zero_grad()
-#
-#         out, prior, post = model.sample_forward(x_train.to(device), samples=train_samples)
-#         out = out.mean(0)
-#         logloss = (- post - prior) * pi[batch] # /x_train.shape[0]
-#         # mmd = (mmd * mmd_w)
-#
-#         max_class = F.log_softmax(out, -1).argmax(dim=-1)
-#         train_pred.extend(max_class.tolist())
-#
-#         ce = F.nll_loss(F.log_softmax(out, -1), y_train.to(device))
-#         loss = ce + logloss
-#         losses.append(loss.item())
-#         loss.backward()
-#         optimizer.step()
-#
-#         progress_bar.set_postfix(log_loss=logloss.item(), ce_loss=ce.item())
-#
-#     test_pred = []
-#     test_true = []
-#
-#     model.eval()
-#     with torch.no_grad():
-#         for i, (x_test, y_test) in enumerate(test_dataset):
-#             test_true.extend(y_test.tolist())
-#
-#             out, _, _ = model.sample_forward(x_test.to(device), samples=test_samples)
-#             out = out.mean(0)
-#             out = out.argmax(dim=-1)
-#             test_pred.extend(out.tolist())
-#
-#     return losses, (train_true, train_pred), (test_true, test_pred)
-
-
-if __name__ == '__main__':
-    from itertools import chain
-
-    import torch
-    from sklearn import metrics
-    from torch import nn
-    from torchvision.transforms import transforms
-    from torchvision import datasets
-    from tqdm import tqdm
-
-    image_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,)),
-        # transforms.Normalize((0,), (1,)),
-        torch.flatten
-    ])
-
-    train_split = datasets.MNIST('./Datasets/MNIST', train=True, download=True,
-                                 transform=image_transform)
-
-    train_loader = torch.utils.data.DataLoader(train_split, batch_size=100, shuffle=True)
-
-    test_loader = torch.utils.data.DataLoader(
-        datasets.MNIST('./Datasets/MNIST', train=False, transform=image_transform), batch_size=1000,
-        shuffle=False)
-
-    input_size = 784
-    classes = 10
-
-    ann = BBB(784, 10, local_trick=False)
-    ann.cuda()
-    trainer = Trainer(ann, train_loader, test_loader, torch.optim.Adam(ann.parameters(), 1e-3))
-
-    for i in range(10):
-       a, _, (test_true, test_pred) = trainer.train_step(test_samples=2, train_samples=2)
-       f1 = metrics.f1_score(test_true, test_pred, average='micro')
-
-       print(f1)
