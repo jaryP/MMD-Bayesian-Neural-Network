@@ -1,10 +1,13 @@
 import torchvision
 
 import ANN
-from base import ScaledMixtureGaussian, Gaussian, BayesianLinearLayer, BayesianCNNLayer
+import DropoutNet
+from base import ScaledMixtureGaussian, Gaussian
+from bayesian_utils import BayesianCNNLayer, BayesianLinearLayer
 from torchvision import datasets
 from torchvision.transforms import transforms
 import torch
+import matplotlib.pyplot as plt
 
 
 def get_dataset(name, batch_size, dev_split):
@@ -16,42 +19,20 @@ def get_dataset(name, batch_size, dev_split):
                 # transforms.Normalize((0,), (1,)),
                 torch.flatten
             ])
-            input_size = 784
-            ann_type = 'linear'
         else:
             image_transform = transforms.Compose([
                 transforms.ToTensor(),
                 transforms.Normalize((0.1307,), (0.3081,)),
                 # transforms.Normalize((0,), (1,)),
             ])
-            input_size = 1
-            ann_type = 'cnn'
 
         train_split = datasets.MNIST('./Datasets/MNIST', train=True, download=True,
                                      transform=image_transform)
         test_split = datasets.MNIST('./Datasets/MNIST', train=False, download=True,
-                                     transform=image_transform)
-        # if dev_split > 0:
-        #     train_size = int((1 - dev_split) * len(train_split))
-        #     test_size = len(train_split) - train_size
-        #
-        #     train_split, dev_split = torch.utils.data.random_split(train_split, [train_size, test_size])
-        #
-        #     train_loader = torch.utils.data.DataLoader(train_split, batch_size=batch_size, shuffle=True)
-        #
-        #     test_loader = torch.utils.data.DataLoader(dev_split, batch_size=batch_size, shuffle=False)
-        #
-        # else:
-        #     train_loader = torch.utils.data.DataLoader(train_split, batch_size=batch_size, shuffle=True)
-        #
-        #     test_loader = torch.utils.data.DataLoader(
-        #         datasets.MNIST('./Datasets/MNIST', train=False, transform=image_transform), batch_size=1000,
-        #         shuffle=False)
+                                    transform=image_transform)
 
-        first_image = train_split[0][0]
-        input_size = 784
+        sample = train_split[0][0]
         classes = 10
-        # return input_size, classes, train_loader, test_loader, ann_type, first_image
 
     if name == 'CIFAR10':
         transform = transforms.Compose(
@@ -59,18 +40,12 @@ def get_dataset(name, batch_size, dev_split):
              transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
 
         train_split = torchvision.datasets.CIFAR10(root='./Datasets/CIFAR10', train=True,
-                                                download=True, transform=transform)
-        # train_loader = torch.utils.data.DataLoader(train_split, batch_size=batch_size,
-        #                                           shuffle=True, num_workers=2)
+                                                   download=True, transform=transform)
 
         test_split = torchvision.datasets.CIFAR10(root='./Datasets/CIFAR10', train=False,
-                                               download=True, transform=transform)
-        # test_loader = torch.utils.data.DataLoader(test_split, batch_size=batch_size,
-        #                                          shuffle=False, num_workers=2)
+                                                  download=True, transform=transform)
         classes = 10
-        input_size = 3
-        first_image = train_split[0][0]
-        # return 3, 10, train_loader, test_loader, 'cnn', train_split[0][0]
+        sample = train_split[0][0]
 
     if dev_split > 0:
         train_size = int((1 - dev_split) * len(train_split))
@@ -87,11 +62,10 @@ def get_dataset(name, batch_size, dev_split):
 
         test_loader = torch.utils.data.DataLoader(test_split, batch_size=batch_size, shuffle=False)
 
-    return input_size, classes, train_loader, test_loader, first_image
+    return sample, classes, train_loader, test_loader
 
 
 def main(experiments):
-
     import sklearn.metrics as metrics
     import tqdm as tqdm
 
@@ -116,6 +90,7 @@ def main(experiments):
         bbb = 'bbb'
         mmd = 'mmd'
         normal = 'normal'
+        dropout = 'dropout'
 
         def __str__(self):
             return self.value
@@ -132,6 +107,7 @@ def main(experiments):
 
     for data in experiments:
         print(data)
+
         # PRIORS
 
         prior = None
@@ -194,6 +170,9 @@ def main(experiments):
             elif network == 'normal':
                 base_model = ANN.ANN
                 trainer = ANN.Trainer
+            elif network == 'dropout':
+                base_model = DropoutNet.Dropnet
+                trainer = DropoutNet.Trainer
 
         if optimizer not in list(map(str, Optimizers)):
             raise ValueError('Supported optimizers', list(Optimizers))
@@ -213,11 +192,11 @@ def main(experiments):
             if dataset not in list(map(str, Datasets)):
                 raise ValueError('Supported datasets {}, given {}'.format(list(Datasets), dataset))
             else:
-                input_size, classes, train_loader, test_loader, first_sample = get_dataset(dataset, batch_size, dev_split)
+                sample, classes, train_loader, test_loader = get_dataset(dataset, batch_size, dev_split)
 
-            model = base_model(input_size=input_size, prior=prior, mu_init=weights_mu_init, device=device,
+            model = base_model(prior=prior, mu_init=weights_mu_init, device=device,
                                rho_init=weights_rho_init, topology=topology, classes=classes, local_trick=local_trick,
-                               input_image=first_sample)
+                               sample=sample)
 
             model.to(device)
             opt = optimizer(model.parameters(), lr=lr)
@@ -254,7 +233,8 @@ def main(experiments):
                 #     ts = train_samples
 
                 loss, (train_true, train_pred), (test_true, test_pred) = t.train_step(train_samples=train_samples,
-                                                                                      test_samples=test_samples)
+                                                                                      test_samples=test_samples,
+                                                                                      weights=loss_weights)
                 loss = np.mean(loss)
 
                 f1 = metrics.f1_score(test_true, test_pred, average='micro')
@@ -287,32 +267,37 @@ def main(experiments):
         print('-' * 200)
         experiments_results.append(run_results)
 
-        to_hist = []
-        if network in ['mmd', 'bbb']:
-            for layer in t.model.features:
-                if isinstance(layer, (BayesianLinearLayer, BayesianCNNLayer)):
-                    w = layer.w
-                    b = layer.b
+        # f1 = results['test_results']
+        # plt.plot(range(len(f1)), f1, label=network)
+        # plt.legend()
+        # print(f1)
+        # to_hist = []
+        # if network in ['mmd', 'bbb']:
+        #     for layer in t.model.features:
+        #         if isinstance(layer, (BayesianLinearLayer, BayesianCNNLayer)):
+        #             w = layer.w
+        #             b = layer.b
+        #
+        #             mean = np.abs(w.mu.detach().cpu().numpy())
+        #             std = w.sigma.detach().cpu().numpy()
+        #             snr = mean/std
+        #             to_hist.append(np.reshape(np.log10(snr), -1))
+        #
+        #             if b is not None:
+        #                 mean = np.abs(b.mu.detach().cpu().numpy())
+        #                 std = b.sigma.detach().cpu().numpy()
+        #                 snr = mean/std
+        #                 to_hist.append(np.reshape(np.log10(snr), -1))
+        #
+        # to_hist = np.concatenate(to_hist)
+        # import matplotlib.pyplot as plt
+        # fig, ax = plt.subplots(nrows=2, ncols=1)
+        # hist, _, _ = ax[0].hist(to_hist, bins=100)
+        # cs = np.cumsum(hist)
+        # ax[1].plot(range(len(cs)), cs)
+        # plt.show()
 
-                    mean = np.abs(w.mu.detach().cpu().numpy())
-                    std = w.sigma.detach().cpu().numpy()
-                    snr = mean/std
-                    to_hist.append(np.reshape(np.log10(snr), -1))
-
-                    if b is not None:
-                        mean = np.abs(b.mu.detach().cpu().numpy())
-                        std = b.sigma.detach().cpu().numpy()
-                        snr = mean/std
-                        to_hist.append(np.reshape(np.log10(snr), -1))
-
-        to_hist = np.concatenate(to_hist)
-        import matplotlib.pyplot as plt
-        fig, ax = plt.subplots(nrows=2, ncols=1)
-        hist, _, _ = ax[0].hist(to_hist, bins=100)
-        cs = np.cumsum(hist)
-        ax[1].plot(range(len(cs)), cs)
-        plt.show()
-
+    plt.show()
     return experiments_results
 
 
