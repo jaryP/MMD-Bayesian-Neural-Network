@@ -1,3 +1,5 @@
+import numpy as np
+
 from torch import nn as nn
 from torch.distributions import Normal
 from torch.nn import Parameter, functional as F
@@ -315,30 +317,67 @@ class BayesDropout(nn.Module):
         return F.dropout(x, p=self.p, training=True, inplace=False)
 
 
+def pdist(p, q):
+    pdim, qdim = p.size(0), q.size(0)
+    pnorm = torch.sum(p**2, dim=1, keepdim=True)
+    qnorm = torch.sum(q**2, dim=1, keepdim=True)
+    norms = (pnorm.expand(pdim, qdim) +
+             qnorm.transpose(0, 1).expand(pdim, qdim))
+    distances_squared = norms - 2 * p.mm(q.t())
+    return torch.sqrt(1e-5 + torch.abs(distances_squared))
+
+
+def pairwise_distances(x, y):
+
+    x_norm = (x**2).sum(1).view(-1, 1)
+    y_norm = (y ** 2).sum(1).view(1, -1)
+
+    dist = x_norm + y_norm - 2.0 * torch.mm(x, torch.transpose(y, 0, 1))
+    return torch.clamp(dist, 0.0, np.inf)
+
+
 def compute_mmd(x, y):
     # dim = x.size(1)
-    xx, yy, xy = torch.mm(x, x.t()), torch.mm(y, y.t()), torch.mm(x, y.t())
+    # xx, yy, xy = torch.mm(x, x.t()), torch.mm(y, y.t()), torch.mm(x, y.t())
+    xx = pdist(x, x)**2
+    yy = pdist(y, y)**2
+    xy = pdist(x, y)**2
 
-    rx = (xx.diag().unsqueeze(0).expand_as(xx))
-    ry = (yy.diag().unsqueeze(0).expand_as(yy))
+    # print(torch.trace())
+    xs, ys = xx.shape[0], yy.shape[0]
 
-    dxx = rx.t() + rx - 2. * xx
-    dyy = ry.t() + ry - 2. * yy
-    dxy = rx.t() + ry - 2. * xy
+    xx = torch.exp(-xx/xs).sum() - xx.trace()
+    yy = torch.exp(-yy/xs).sum() - yy.trace()
+    xy = torch.exp(-xy/xs).sum()
+
+    mmd = (2/(ys*xs)) * xy + (1/(xs**2)) * xx + (1/(ys**2)) * yy
+
+    # xx = xx - torch.trace(xx)
+    # yy = yy - torch.trace(yy)
+    #
+    # xx =
+
+    # rx = (xx.diag().unsqueeze(0).expand_as(xx))
+    # ry = (yy.diag().unsqueeze(0).expand_as(yy))
+
+    # dxx = rx.t() + rx - 2. * xx
+    # dyy = ry.t() + ry - 2. * yy
+    # dxy = rx.t() + ry - 2. * xy
 
     # print(xx.device)
-    XX, YY, XY = (torch.zeros(xx.shape).to(x.device),
-                  torch.zeros(xx.shape).to(x.device),
-                  torch.zeros(xx.shape).to(x.device))
-
-    for a in [0.05, 0.1, 0.2, 0.9]:
-        XX += a**2 * (a**2 + dxx)**-1
-        YY += a**2 * (a**2 + dyy)**-1
-        XY += a**2 * (a**2 + dxy)**-1
+    # XX, YY, XY = (torch.zeros(xx.shape).to(x.device),
+    #               torch.zeros(xx.shape).to(x.device),
+    #               torch.zeros(xx.shape).to(x.device))
+    # #
+    # for a in [0.05, 0.1, 0.2, 0.9]:
+    #     XX += a**2 * (a**2 + dxx)**-1
+    #     YY += a**2 * (a**2 + dyy)**-1
+    #     XY += a**2 * (a**2 + dxy)**-1
 
     # # for a in [dim]:
-    # XX = (torch.exp(-xx) * dim ** -1).mean()
-    # YY = (torch.exp(-yy) * dim ** -1).mean()
-    # XY = (torch.exp(-xy) * dim ** -1).mean()
+    # XX = torch.exp(-xx/dim).mean()
+    # YY = torch.exp(-yy/dim).mean()
+    # XY = torch.exp(-xy/dim).mean()
 
-    return torch.mean(XX + YY - 2. * XY)
+    # return torch.mean(XX + YY - 2. * XY)
+    return mmd

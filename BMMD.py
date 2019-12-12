@@ -88,58 +88,6 @@ class BMMD(Network):
         self._prior = prior
         self.features = get_bayesian_network(topology, sample, classes,
                                              mu_init, rho_init, prior, 'mmd', local_trick)
-        # print(self.features)
-        # self.features = torch.nn.ModuleList()
-        #
-        # prev = input_size
-        # input_image = input_image.unsqueeze(0)
-        #
-        # for j, i in enumerate(topology):
-        #
-        #     if isinstance(i, (tuple, list)) and i[0] == 'MP':
-        #         l = torch.nn.MaxPool2d(i[1])
-        #         input_image = l(input_image)
-        #         prev = input_image.shape[1]
-        #
-        #     elif isinstance(i, (tuple, list)) and i[0] == 'AP':
-        #         l = torch.nn.AvgPool2d(i[1])
-        #         input_image = l(input_image)
-        #         prev = input_image.shape[1]
-        #
-        #     elif isinstance(i, (tuple, list)):
-        #         size, kernel_size = i
-        #         l = BayesianCNNLayer(in_channels=prev, kernels=size, kernel_size=kernel_size,
-        #                              mu_init=mu_init, divergence='mmd', local_rep_trick=local_trick,
-        #                              rho_init=rho_init, prior=self._prior)
-        #
-        #         input_image = l(input_image)[0]
-        #         prev = input_image.shape[1]
-        #
-        #     elif isinstance(i, int):
-        #         if j > 0 and not isinstance(topology[j-1], int):
-        #             input_image = torch.flatten(input_image, 1)
-        #             prev = input_image.shape[-1]
-        #             self.features.append(Flatten())
-        #
-        #         size = i
-        #         l = BayesianLinearLayer(in_size=prev, out_size=size, mu_init=mu_init, divergence='mmd',
-        #                                 rho_init=rho_init, prior=self._prior, local_rep_trick=local_trick)
-        #         prev = size
-        #
-        #     else:
-        #         raise ValueError('Topology should be tuple for cnn layers, formatted as (num_kernels, kernel_size), '
-        #                          'pooling layer, formatted as tuple ([\'MP\', \'AP\'], kernel_size, stride) '
-        #                          'or integer, for linear layer. {} was given'.format(i))
-        #
-        #     self.features.append(l)
-        #
-        # if isinstance(topology[-1], (tuple, list)):
-        #     input_image = torch.flatten(input_image, 1)
-        #     prev = input_image.shape[-1]
-        #     self.features.append(Flatten())
-        #
-        # self.features.append(BayesianLinearLayer(in_size=prev, out_size=classes, mu_init=mu_init, rho_init=rho_init,
-        #                                          prior=self._prior, divergence='mmd', local_rep_trick=local_trick))
         # ##################### non abbandonarmi più jary!!!!
         # ##################### Scusa :'(
 
@@ -189,7 +137,7 @@ class Trainer(Wrapper):
         losses = []
 
         self.model.train()
-        progress_bar = tqdm(enumerate(self.train_data), total=len(self.train_data), disable=True)
+        progress_bar = tqdm(enumerate(self.train_data), total=len(self.train_data), disable=False)
         progress_bar.set_postfix(mmd_loss='not calculated', ce_loss='not calculated')
 
         train_true = []
@@ -197,7 +145,7 @@ class Trainer(Wrapper):
 
         M = len(self.train_data)
         a = np.asarray([2 ** (M - i - 1) for i in range(M + 1)])
-        b = 2 ** M - 1
+        b = 2 ** (M - 1)
 
         pi = a / b
 
@@ -209,20 +157,23 @@ class Trainer(Wrapper):
 
             out, mmd = self.model(x_train.to(self.device), samples=samples)
             out = out.mean(0)
-            # mmd /= x_train.shape[0]
-            # mmd *= 10
+            # print(mmd)
+            # mmd = mmd*-1
+            # mmd *= 1000
+            # mmd *= pi[batch]
+            mmd /= x_train.shape[0]
 
             max_class = F.softmax(out, -1).argmax(dim=-1)
             train_pred.extend(max_class.tolist())
 
-            ce = F.cross_entropy(out, y_train.to(self.device), reduction='sum')
+            ce = F.cross_entropy(out, y_train.to(self.device), reduction='mean')
             loss = ce + mmd
             # loss = mmd
             losses.append(loss.item())
             loss.backward()
             self.optimizer.step()
 
-            progress_bar.set_postfix(ce_loss=loss.item(), mmd_loss=mmd.item())
+            progress_bar.set_postfix(ce_loss=ce.item(), mmd_loss=mmd.item())
 
         return losses, (train_true, train_pred)
 

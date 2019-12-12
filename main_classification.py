@@ -130,8 +130,8 @@ def main(experiments):
         optimizer = data.get('optimizer', 'adam').lower()
         dataset = data["dataset"]
         network = data["network_type"].lower()
-        experiments = data.get('experiments', 1)
-        seeds = data.get('experiments_seeds', 0)
+        # experiments = data.get('experiments', 1)
+        seeds = data.get('experiments_seeds', [0])
         device = 'cuda' if torch.cuda.is_available() and data.get('use_cuda', True) else 'cpu'
         save_path = data['save_path']
         loss_weights = data.get('loss_weights', {})
@@ -143,20 +143,21 @@ def main(experiments):
         load = data['load']
         dev_split = data.get('dev_split', 0)
         local_trick = data.get('local_trick', False)
+        label = data.get("label", network)
 
         if epochs < 0:
             raise ValueError('The number of epoch should be > 0')
 
-        if isinstance(experiments, int):
-            experiments = [experiments]
+        # if isinstance(experiments, int):
+        #     experiments = [experiments]
 
         if isinstance(seeds, int):
             seeds = [seeds]
 
-        if isinstance(experiments, list):
-            if (not isinstance(seeds, list)) or (isinstance(seeds, list) and len(experiments) != len(seeds)):
-                raise ValueError('The number of the experiments and the number of seeds needs to match, '
-                                 'given: {} and {}'.format(experiments, seeds))
+        # if isinstance(experiments, list):
+        #     if (not isinstance(seeds, list)) or (isinstance(seeds, list) and len(experiments) != len(seeds)):
+        #         raise ValueError('The number of the experiments and the number of seeds needs to match, '
+        #                          'given: {} and {}'.format(experiments, seeds))
 
         if network not in list(map(str, NetworkTypes)):
             raise ValueError('Supported networks', list(NetworkTypes))
@@ -184,7 +185,7 @@ def main(experiments):
                 optimizer = torch.optim.Adam
 
         run_results = []
-        for e, seed in zip(experiments, seeds):
+        for e, seed in enumerate(seeds):
 
             torch.manual_seed(seed)
             np.random.seed(seed)
@@ -227,12 +228,25 @@ def main(experiments):
 
             for i in progress_bar:
 
-                # if i == 0:
-                #     ts = 10
-                # else:
-                #     ts = train_samples
+                if i == 0:
+                    ts = 10
+                else:
+                    ts = train_samples
 
-                loss, (train_true, train_pred), (test_true, test_pred) = t.train_step(train_samples=train_samples,
+                if i == 0:
+                    (test_true, test_pred) = t.test_evaluation(samples=test_samples)
+
+                    f1 = metrics.f1_score(test_true, test_pred, average='micro')
+
+                    epochs_res = results.get('test_results', [])
+                    epochs_res.append(f1)
+
+                    epochs_res_train = results.get('train_results', [])
+                    epochs_res_train.append(f1_train)
+
+                    results.update({'epoch': i, 'test_results': epochs_res})
+
+                loss, (train_true, train_pred), (test_true, test_pred) = t.train_step(train_samples=ts,
                                                                                       test_samples=test_samples,
                                                                                       weights=loss_weights)
                 loss = np.mean(loss)
@@ -264,50 +278,105 @@ def main(experiments):
             run_results.append(results)
             progress_bar.close()
 
+            # plt.figure(0)
+            to_hist = []
+            if network in ['mmd', 'bbb']:
+                for layer in t.model.features:
+                    if isinstance(layer, (BayesianLinearLayer, BayesianCNNLayer)):
+                        w = layer.w
+                        b = layer.b
+
+                        mean = np.abs(w.mu.detach().cpu().numpy())
+                        std = w.sigma.detach().cpu().numpy()
+                        snr = mean / std
+                        to_hist.append(np.reshape(10 * np.log10(snr), -1))
+
+                        if b is not None:
+                            mean = np.abs(b.mu.detach().cpu().numpy())
+                            std = b.sigma.detach().cpu().numpy()
+                            snr = mean / std
+                            to_hist.append(np.reshape(10 * np.log10(snr), -1))
+
+                to_hist = np.concatenate(to_hist)
+                # import matplotlib.pyplot as plt
+                fig, ax = plt.subplots(nrows=2, ncols=1)
+                hist, _, _ = ax[0].hist(to_hist, bins=100)
+                cs = np.cumsum(hist)
+                ax[1].plot(range(len(cs)), cs)
+                # plt.show()
+                plt.savefig(os.path.join(current_path, "{}_{}_weights_distribution.pdf".format(e, network)),
+                            bbox_inches='tight')
+
         print('-' * 200)
         experiments_results.append(run_results)
 
         # f1 = results['test_results']
-        # plt.plot(range(len(f1)), f1, label=network)
+        # plt.plot(range(len(f1)), f1, label=label)
         # plt.legend()
         # print(f1)
-        # to_hist = []
-        # if network in ['mmd', 'bbb']:
-        #     for layer in t.model.features:
-        #         if isinstance(layer, (BayesianLinearLayer, BayesianCNNLayer)):
-        #             w = layer.w
-        #             b = layer.b
-        #
-        #             mean = np.abs(w.mu.detach().cpu().numpy())
-        #             std = w.sigma.detach().cpu().numpy()
-        #             snr = mean/std
-        #             to_hist.append(np.reshape(np.log10(snr), -1))
-        #
-        #             if b is not None:
-        #                 mean = np.abs(b.mu.detach().cpu().numpy())
-        #                 std = b.sigma.detach().cpu().numpy()
-        #                 snr = mean/std
-        #                 to_hist.append(np.reshape(np.log10(snr), -1))
-        #
-        # to_hist = np.concatenate(to_hist)
-        # import matplotlib.pyplot as plt
-        # fig, ax = plt.subplots(nrows=2, ncols=1)
-        # hist, _, _ = ax[0].hist(to_hist, bins=100)
-        # cs = np.cumsum(hist)
-        # ax[1].plot(range(len(cs)), cs)
-        # plt.show()
 
-    plt.show()
+
+    # plt.show()
+
+    fig = plt.figure()
+    for d, r in zip(experiments, experiments_results):
+        res = [i['test_results'][1:] for i in r]
+        res = 100 - np.asarray(res)*100
+
+        # print(res.shape, res.mean(0), res.std(0))
+        means = res.mean(0)
+        stds = res.std(0)
+
+        f1 = means
+
+        plt.plot(range(len(f1)), f1, label=d.get('label'))
+
+        plt.fill_between(range(len(f1)), f1 - stds, f1 + stds, alpha=0.1)
+
+        plt.legend()
+
+        # print(f1)
+    # plt.ylim(0.95, 1)
+
+    plt.ylabel("Error test (%)")
+    plt.xlabel("Epochs")
+    plt.savefig(os.path.join(save_path, "score.pdf"), bbox_inches='tight')
+
     return experiments_results
 
 
 if __name__ == '__main__':
     import json
     import sys
+    import numpy as np
 
     args = sys.argv[1:]
 
     with open(args[0], "r") as read_file:
         experiments = json.load(read_file)
 
+    # print(len(experiments))
     results = main(experiments)
+
+    # fig = plt.figure()
+    # for d, r in zip(experiments, results):
+    #     res = [i['test_results'][1:] for i in r]
+    #     res = np.asarray(res)
+    #
+    #     # print(res.shape, res.mean(0), res.std(0))
+    #     means = res.mean(0)
+    #     stds = res.std(0)
+    #
+    #     f1 = means
+    #
+    #     plt.plot(range(len(f1)), f1, label=d.get('label'))
+    #
+    #     plt.fill_between(range(len(f1)), f1 - stds, f1 + stds, alpha=0.3)
+    #
+    #     plt.legend()
+    #     # print(f1)
+    # # plt.ylim(0.95, 1)
+    #
+    # plt.ylabel("Error test (%)")
+    # plt.xlabel("Epochs")
+    # plt.show()

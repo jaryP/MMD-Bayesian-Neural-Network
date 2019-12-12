@@ -15,76 +15,7 @@ class ANN(Network):
         if topology is None:
             topology = [400, 400]
 
-        # self.features = torch.nn.ModuleList()
         self.features = get_network(topology, sample, classes)
-
-        # prev = input_size
-        #
-        # self.ann_type = ann_type
-        # for i in topology:
-        #     l = None
-        #     if ann_type == 'linear':
-        #         l = torch.nn.Linear(prev, i)
-        #     else:
-        #         l = torch.nn.Conv2d(in_channels=prev, out_channels=i, kernel_size=3)
-        #
-        #     self.features.append(l)
-        #     prev = i
-        #
-        # input_image = input_image.unsqueeze(0)
-        # if ann_type == 'cnn':
-        #     for f in self.features:
-        #         input_image = f(input_image)
-        #     input_image = torch.flatten(input_image)
-        #     prev = input_image.shape[0]
-        # # print(prev)
-        # self.classificator = nn.ModuleList([torch.nn.Linear(prev, classes)])
-
-        # prev = input_size
-        # input_image = input_image.unsqueeze(0)
-        #
-        # for j, i in enumerate(topology):
-        #
-        #     if isinstance(i, (tuple, list)) and i[0] == 'MP':
-        #         l = torch.nn.MaxPool2d(i[1])
-        #         input_image = l(input_image)
-        #         prev = input_image.shape[1]
-        #
-        #     elif isinstance(i, (tuple, list)) and i[0] == 'AP':
-        #         l = torch.nn.AvgPool2d(i[1])
-        #         input_image = l(input_image)
-        #         prev = input_image.shape[1]
-        #
-        #     elif isinstance(i, (tuple, list)):
-        #         size, kernel_size = i
-        #         l = torch.nn.Conv2d(in_channels=prev, out_channels=size, kernel_size=kernel_size)
-        #
-        #         input_image = l(input_image)
-        #         prev = input_image.shape[1]
-        #
-        #     elif isinstance(i, int):
-        #         if j > 0 and not isinstance(topology[j - 1], int):
-        #             input_image = torch.flatten(input_image, 1)
-        #             prev = input_image.shape[-1]
-        #             self.features.append(Flatten())
-        #
-        #         size = i
-        #         l = torch.nn.Linear(prev, i)
-        #         prev = size
-        #
-        #     else:
-        #         raise ValueError('Topology should be tuple for cnn layers, formatted as (num_kernels, kernel_size), '
-        #                          'pooling layer, formatted as tuple ([\'MP\', \'AP\'], kernel_size, stride) '
-        #                          'or integer, for linear layer. {} was given'.format(i))
-        #
-        #     self.features.append(l)
-        #
-        # if isinstance(topology[-1], (tuple, list)):
-        #     input_image = torch.flatten(input_image, 1)
-        #     prev = input_image.shape[-1]
-        #     self.features.append(Flatten())
-        #
-        # self.features.append(torch.nn.Linear(prev, classes))
 
     def forward(self, x):
 

@@ -6,26 +6,27 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 
-def pairwise_distances(x, y):
-    x_norm = (x ** 2).sum(1).view(-1, 1)
-    y_norm = (y ** 2).sum(1).view(1, -1)
-
-    dist = x_norm + y_norm - 2.0 * torch.mm(x, torch.transpose(y, 0, 1))
-    return torch.clamp(dist, 0.0, np.inf)
 #
+# def pairwise_distances(x, y):
+#     x_norm = (x ** 2).sum(1).view(-1, 1)
+#     y_norm = (y ** 2).sum(1).view(1, -1)
 #
-def compute_kernel(x, y):
-    dim = x.size(1)
-    # d = torch.exp(- torch.mul(torch.cdist(x, y).mean(1), 1/float(dim))).mean()
-    d = torch.exp(- torch.mul(pairwise_distances(x, y).mean(1), 1 / float(dim))).mean()
-    return d
-#
-#
-def compute_mmd(x, y):
-    x_kernel = compute_kernel(x, x)
-    y_kernel = compute_kernel(y, y)
-    xy_kernel = compute_kernel(x, y)
-    return x_kernel + y_kernel - 2 * xy_kernel
+#     dist = x_norm + y_norm - 2.0 * torch.mm(x, torch.transpose(y, 0, 1))
+#     return torch.clamp(dist, 0.0, np.inf)
+# #
+# #
+# def compute_kernel(x, y):
+#     dim = x.size(1)
+#     # d = torch.exp(- torch.mul(torch.cdist(x, y).mean(1), 1/float(dim))).mean()
+#     d = torch.exp(- torch.mul(pairwise_distances(x, y).mean(1), 1 / float(dim))).mean()
+#     return d
+# #
+# #
+# def compute_mmd(x, y):
+#     x_kernel = compute_kernel(x, x)
+#     y_kernel = compute_kernel(y, y)
+#     xy_kernel = compute_kernel(x, y)
+#     return x_kernel + y_kernel - 2 * xy_kernel
 
 
 from bayesian_utils import BayesianCNNLayer, BayesianLinearLayer
@@ -44,6 +45,9 @@ def get_bayesian_network(topology, input_image, classes, mu_init, rho_init, prio
             l = torch.nn.MaxPool2d(i[1])
             input_image = l(input_image)
             prev = input_image.shape[1]
+
+        elif isinstance(i, float):
+            l = torch.nn.Dropout(p=0.5)
 
         elif isinstance(i, (tuple, list)) and i[0] == 'AP':
             l = torch.nn.AvgPool2d(i[1])
@@ -66,7 +70,7 @@ def get_bayesian_network(topology, input_image, classes, mu_init, rho_init, prio
                 features.append(Flatten())
 
             size = i
-            l = BayesianLinearLayer(in_size=prev, out_size=size, mu_init=mu_init, divergence='mmd',
+            l = BayesianLinearLayer(in_size=prev, out_size=size, mu_init=mu_init, divergence=divergence,
                                     rho_init=rho_init, prior=prior, local_rep_trick=local_trick)
             prev = size
 
@@ -83,7 +87,7 @@ def get_bayesian_network(topology, input_image, classes, mu_init, rho_init, prio
         features.append(Flatten())
 
     features.append(BayesianLinearLayer(in_size=prev, out_size=classes, mu_init=mu_init, rho_init=rho_init,
-                                        prior=prior, divergence='mmd', local_rep_trick=local_trick))
+                                        prior=prior, divergence=divergence, local_rep_trick=local_trick))
     return features
 
 
@@ -99,6 +103,9 @@ def get_network(topology, input_image, classes):
             l = torch.nn.MaxPool2d(i[1])
             input_image = l(input_image)
             prev = input_image.shape[1]
+
+        elif isinstance(i, float):
+            l = torch.nn.Dropout(p=0.5)
 
         elif isinstance(i, (tuple, list)) and i[0] == 'AP':
             l = torch.nn.AvgPool2d(i[1])

@@ -31,57 +31,6 @@ class BBB(Network):
         self._prior = prior
         self.features = get_bayesian_network(topology, sample, classes,
                                              mu_init, rho_init, prior, 'kl', local_trick)
-        # self.features = torch.nn.ModuleList()
-        #
-        # prev = input_size
-        # input_image = input_image.unsqueeze(0)
-        #
-        # for j, i in enumerate(topology):
-        #
-        #     if isinstance(i, (tuple, list)) and i[0] == 'MP':
-        #         l = torch.nn.MaxPool2d(i[1])
-        #         input_image = l(input_image)
-        #         prev = input_image.shape[1]
-        #
-        #     elif isinstance(i, (tuple, list)) and i[0] == 'AP':
-        #         l = torch.nn.AvgPool2d(i[1])
-        #         input_image = l(input_image)
-        #         prev = input_image.shape[1]
-        #
-        #     elif isinstance(i, (tuple, list)):
-        #         size, kernel_size = i
-        #         l = BayesianCNNLayer(in_channels=prev, kernels=size, kernel_size=kernel_size,
-        #                              mu_init=mu_init, divergence='kl', local_rep_trick=local_trick,
-        #                              rho_init=rho_init, prior=self._prior)
-        #
-        #         input_image = l(input_image)[0]
-        #         prev = input_image.shape[1]
-        #
-        #     elif isinstance(i, int):
-        #         if j > 0 and not isinstance(topology[j-1], int):
-        #             input_image = torch.flatten(input_image, 1)
-        #             prev = input_image.shape[-1]
-        #             self.features.append(Flatten())
-        #
-        #         size = i
-        #         l = BayesianLinearLayer(in_size=prev, out_size=size, mu_init=mu_init, divergence='kl',
-        #                                 rho_init=rho_init, prior=self._prior, local_rep_trick=local_trick)
-        #         prev = size
-        #
-        #     else:
-        #         raise ValueError('Topology should be tuple for cnn layers, formatted as (num_kernels, kernel_size), '
-        #                          'pooling layer, formatted as tuple ([\'MP\', \'AP\'], kernel_size) '
-        #                          'or integer, for linear layer. {} was given'.format(i))
-        #
-        #     self.features.append(l)
-        #
-        # if isinstance(topology[-1], (tuple, list)):
-        #     input_image = torch.flatten(input_image, 1)
-        #     prev = input_image.shape[-1]
-        #     self.features.append(Flatten())
-        #
-        # self.features.append(BayesianLinearLayer(in_size=prev, out_size=classes, mu_init=mu_init, rho_init=rho_init,
-        #                                          prior=self._prior, divergence='kl', local_rep_trick=local_trick))
 
     def _forward(self, x):
 
@@ -98,16 +47,6 @@ class BBB(Network):
 
             if j < len(self.features)-1:
                 x = torch.relu(x)
-
-        #     x = torch.relu(x)
-        #
-        # if self.ann_type == 'cnn':
-        #     x = torch.flatten(x, 1)
-        #
-        # for i in self.classificator:
-        #     x, prior, post = i(x)
-        #     tot_post += post
-        #     tot_prior += prior
 
         return x, tot_prior, tot_post
 
