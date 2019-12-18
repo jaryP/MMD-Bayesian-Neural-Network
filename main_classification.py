@@ -1,13 +1,12 @@
+import matplotlib.pyplot as plt
+import torch
 import torchvision
+from torchvision import datasets
+from torchvision.transforms import transforms
 
 import ANN
 import DropoutNet
 from base import ScaledMixtureGaussian, Gaussian
-from bayesian_utils import BayesianCNNLayer, BayesianLinearLayer
-from torchvision import datasets
-from torchvision.transforms import transforms
-import torch
-import matplotlib.pyplot as plt
 
 
 def get_dataset(name, batch_size, dev_split):
@@ -37,7 +36,7 @@ def get_dataset(name, batch_size, dev_split):
     if name == 'CIFAR10':
         transform = transforms.Compose(
             [transforms.ToTensor(),
-             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+             transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261))])
 
         train_split = torchvision.datasets.CIFAR10(root='./Datasets/CIFAR10', train=True,
                                                    download=True, transform=transform)
@@ -63,6 +62,44 @@ def get_dataset(name, batch_size, dev_split):
         test_loader = torch.utils.data.DataLoader(test_split, batch_size=batch_size, shuffle=False)
 
     return sample, classes, train_loader, test_loader
+
+
+def plot_test(exps, tests):
+
+    fig, ax = plt.subplots(nrows=3)
+
+    for d, r in zip(exps, tests):
+
+        if r[0] is None:
+            continue
+
+        h, diff,  scores = [], [], []
+
+        for i in r:
+            h.append(i[0])
+            diff.append(i[1])
+            scores.append(i[2])
+
+        h = np.asarray(h).mean(0)
+        diff = np.asarray(diff).mean(0)
+        scores = np.asarray(scores).mean(0)
+
+        x = range(len(scores))
+        ax[0].plot(x, scores, label=d.get('label', d['network_type']), c=d['color'])
+
+        ax[1].plot(x, h[:, 0],# linestyle='--',
+                   label='{} uncertainty'.format(d.get('label', d['network_type'])), c=d['color'])
+
+        # ax[1].plot(x, h[:, 1], linestyle='-.',
+        #            label='{} uncertainty'.format(d.get('label', d['network_type'])), c=d['color'])
+
+        ax[2].plot(x, diff,
+                   label='{} (top1-top2)**2'.format(d.get('label', d['network_type'])), c=d['color'])
+
+    handles, labels = ax[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='upper center')
+
+    return fig, ax
 
 
 def main(experiments):
@@ -104,6 +141,8 @@ def main(experiments):
             return self.value
 
     experiments_results = []
+    adversarial_attack_results = []
+    rotation_results = []
 
     for data in experiments:
         print(data)
@@ -125,8 +164,8 @@ def main(experiments):
         batch_size = data.get('batch_size', 64)
         lr = data.get('lr', 1e-3)
         topology = data['topology']
-        weights_mu_init = data.get('weights_mu_init')
-        weights_rho_init = data.get('weights_rho_init')
+        weights_mu_init = data.get('weights_mu_init', None)
+        weights_rho_init = data.get('weights_rho_init', -3)
         optimizer = data.get('optimizer', 'adam').lower()
         dataset = data["dataset"]
         network = data["network_type"].lower()
@@ -144,6 +183,7 @@ def main(experiments):
         dev_split = data.get('dev_split', 0)
         local_trick = data.get('local_trick', False)
         label = data.get("label", network)
+        network_parameters = data.get('network_parameters', {})
 
         if epochs < 0:
             raise ValueError('The number of epoch should be > 0')
@@ -165,15 +205,19 @@ def main(experiments):
             if network == 'mmd':
                 base_model = BMMD.BMMD
                 trainer = BMMD.Trainer
+                data['color'] = 'red'
             elif network == 'bbb':
                 base_model = BBB.BBB
                 trainer = BBB.Trainer
+                data['color'] = 'green'
             elif network == 'normal':
                 base_model = ANN.ANN
                 trainer = ANN.Trainer
+                data['color'] = 'blue'
             elif network == 'dropout':
                 base_model = DropoutNet.Dropnet
                 trainer = DropoutNet.Trainer
+                data['color'] = 'k'
 
         if optimizer not in list(map(str, Optimizers)):
             raise ValueError('Supported optimizers', list(Optimizers))
@@ -185,6 +229,9 @@ def main(experiments):
                 optimizer = torch.optim.Adam
 
         run_results = []
+        local_rotate_res = []
+        local_attack_res = []
+
         for e, seed in enumerate(seeds):
 
             torch.manual_seed(seed)
@@ -197,7 +244,7 @@ def main(experiments):
 
             model = base_model(prior=prior, mu_init=weights_mu_init, device=device,
                                rho_init=weights_rho_init, topology=topology, classes=classes, local_trick=local_trick,
-                               sample=sample)
+                               sample=sample, **network_parameters)
 
             model.to(device)
             opt = optimizer(model.parameters(), lr=lr)
@@ -218,6 +265,8 @@ def main(experiments):
                 opt.load_state_dict(checkpoint['optimizer_state_dict'])
                 epoch_start = checkpoint['epoch'] + 1
                 results = checkpoint
+                # print(results.get('test_results')[1:])
+                # print(results.get('train_results'))
 
             f1 = results.get('test_results', ['not calculated'])[-1]
             f1_train = results.get('train_results', ['not calculated'])[-1]
@@ -227,11 +276,6 @@ def main(experiments):
             t = trainer(model, train_loader, test_loader, opt)
 
             for i in progress_bar:
-
-                if i == 0:
-                    ts = 10
-                else:
-                    ts = train_samples
 
                 if i == 0:
                     (test_true, test_pred) = t.test_evaluation(samples=test_samples)
@@ -246,7 +290,7 @@ def main(experiments):
 
                     results.update({'epoch': i, 'test_results': epochs_res})
 
-                loss, (train_true, train_pred), (test_true, test_pred) = t.train_step(train_samples=ts,
+                loss, (train_true, train_pred), (test_true, test_pred) = t.train_step(train_samples=train_samples,
                                                                                       test_samples=test_samples,
                                                                                       weights=loss_weights)
                 loss = np.mean(loss)
@@ -279,33 +323,70 @@ def main(experiments):
             progress_bar.close()
 
             # plt.figure(0)
-            to_hist = []
-            if network in ['mmd', 'bbb']:
-                for layer in t.model.features:
-                    if isinstance(layer, (BayesianLinearLayer, BayesianCNNLayer)):
-                        w = layer.w
-                        b = layer.b
 
-                        mean = np.abs(w.mu.detach().cpu().numpy())
-                        std = w.sigma.detach().cpu().numpy()
-                        snr = mean / std
-                        to_hist.append(np.reshape(10 * np.log10(snr), -1))
+            if network != 'normal':
+                h1 = t.rotation_test(samples=test_samples)
+                h2 = t.attack_test(samples=test_samples)
 
-                        if b is not None:
-                            mean = np.abs(b.mu.detach().cpu().numpy())
-                            std = b.sigma.detach().cpu().numpy()
-                            snr = mean / std
-                            to_hist.append(np.reshape(10 * np.log10(snr), -1))
+                local_rotate_res.append(h1)
+                local_attack_res.append(h2)
+            else:
+                local_rotate_res.append(None)
+                local_attack_res.append(None)
 
-                to_hist = np.concatenate(to_hist)
-                # import matplotlib.pyplot as plt
-                fig, ax = plt.subplots(nrows=2, ncols=1)
-                hist, _, _ = ax[0].hist(to_hist, bins=100)
-                cs = np.cumsum(hist)
-                ax[1].plot(range(len(cs)), cs)
-                # plt.show()
-                plt.savefig(os.path.join(current_path, "{}_{}_weights_distribution.pdf".format(e, network)),
-                            bbox_inches='tight')
+            # if network in ['bbb', 'mmd']:
+            #     to_hist = []
+            #     last = None
+            #     for layer in t.model.features:
+            #         if isinstance(layer, (BayesianLinearLayer, BayesianCNNLayer)):
+            #             last = layer
+            #             w = layer.w
+            #             b = layer.b
+            #
+            #             mean = np.abs(w.mu.detach().cpu().numpy())
+            #             std = w.sigma.detach().cpu().numpy()
+            #             snr = mean / std
+            #             to_hist.append(np.reshape(10 * np.log10(snr), -1))
+            #
+            #             if b is not None:
+            #                 mean = np.abs(b.mu.detach().cpu().numpy())
+            #                 std = b.sigma.detach().cpu().numpy()
+            #                 snr = mean / std
+            #                 to_hist.append(np.reshape(10 * np.log10(snr), -1))
+            #
+            #     to_hist = np.concatenate(to_hist)
+            #     # import matplotlib.pyplot as plt
+            #     fig, ax = plt.subplots(nrows=2, ncols=1)
+            #     hist, _, _ = ax[0].hist(to_hist, bins=100)
+            #     cs = np.cumsum(hist)
+            #     ax[1].plot(range(len(cs)), cs)
+            #     # plt.show()
+            #
+            #     plt.savefig(os.path.join(current_path, "{}_{}_weights_distribution.pdf".format(e, network)),
+            #                 bbox_inches='tight')
+            #     plt.close()
+            #
+            #     plt.figure()
+            #
+            #     last_mu = last.w.mu.detach().cpu().numpy().mean(-1)
+            #     last_sigma = last.w.sigma.detach().cpu().numpy().mean(-1)
+            #
+            #     for mu, sigma in zip(last_mu, last_sigma):
+            #         # print(mu, sigma)
+            #         x = np.linspace(mu - 3 * sigma, mu + 3 * sigma, 100)
+            #         plt.plot(x, stats.norm.pdf(x, mu, sigma))
+            #
+            #     plt.show()
+            #     plt.close()
+
+        # print(np.asarray(local_rotate_res))
+        # print(np.asarray(local_rotate_res).mean(0))
+
+        # print(np.asarray(local_rotate_res).shape)
+        rotation_results.append(local_rotate_res)
+        adversarial_attack_results.append(local_attack_res)
+        # print(rotation_results[-1].shape)
+        # adversarial_attack_results.append(np.asarray(local_attack_res).mean(0))
 
         print('-' * 200)
         experiments_results.append(run_results)
@@ -315,10 +396,22 @@ def main(experiments):
         # plt.legend()
         # print(f1)
 
-
     # plt.show()
 
-    fig = plt.figure()
+    fig, ax = plot_test(experiments, rotation_results)
+    for a in ax:
+        a.set_xticklabels(['']+ANN.Trainer.rotations)
+    # fig.draw()
+    fig.savefig(os.path.join(save_path, "rotation.pdf"), bbox_inches='tight')
+    plt.close(fig)
+
+    fig, ax = plot_test(experiments, adversarial_attack_results)
+    for a in ax:
+        a.set_xticklabels(['']+ANN.Trainer.epsilons)
+    fig.savefig(os.path.join(save_path, "fgsa.pdf"), bbox_inches='tight')
+    plt.close(fig)
+
+    plt.figure(0)
     for d, r in zip(experiments, experiments_results):
         res = [i['test_results'][1:] for i in r]
         res = 100 - np.asarray(res)*100
@@ -329,13 +422,14 @@ def main(experiments):
 
         f1 = means
 
-        plt.plot(range(len(f1)), f1, label=d.get('label'))
+        plt.plot(range(len(f1)), f1, label=d.get('label', d['network_type']), c=d['color'])
 
-        plt.fill_between(range(len(f1)), f1 - stds, f1 + stds, alpha=0.1)
+        plt.fill_between(range(len(f1)), f1 - stds, f1 + stds, alpha=0.1, color=d['color'])
 
         plt.legend()
 
-        # print(f1)
+    plt.xticks(range(len(f1)), [i + 1 for i in range(len(f1))])
+    # print(f1)
     # plt.ylim(0.95, 1)
 
     plt.ylabel("Error test (%)")
@@ -380,3 +474,4 @@ if __name__ == '__main__':
     # plt.ylabel("Error test (%)")
     # plt.xlabel("Epochs")
     # plt.show()
+

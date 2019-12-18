@@ -16,6 +16,26 @@ class BayesianCNNLayer(nn.Module):
         if divergence not in ['mmd', 'kl']:
             raise ValueError('type parameter should be mmd or kl.')
 
+        if mu_init is None:
+            input_size = kernels * np.power(in_channels, 2)
+            # std = 1/np.sqrt(std)
+            std = np.sqrt(2/input_size)
+
+            # std *= 3
+            mu_init = (-std, std)
+            # rho_init = np.log(np.exp(2/(3*input_size)) - 1)
+            # print(mu_init, rho_init)
+
+        if rho_init is None:
+            rho_init = -3
+        # input_size = kernels * np.power(in_channels, 2)
+        # std = np.sqrt(2/input_size)
+        # # mu_init = [-std, std]
+        # # rho_init = -3
+        #
+        # mu_init = [-std, std]
+        # rho_init = -3
+
         self.divergence = divergence
 
         self.in_channels = in_channels
@@ -26,7 +46,7 @@ class BayesianCNNLayer(nn.Module):
                                     mu_initialization=mu_init, rho_initialization=rho_init)
 
         if local_rep_trick:
-            self.log_alpha = Parameter(torch.Tensor(1, 1))
+            self.log_alpha = nn.Parameter(torch.zeros((1, 1)).uniform_(*mu_init))
 
         self.b = None
         # if use_bias:
@@ -52,17 +72,17 @@ class BayesianCNNLayer(nn.Module):
             w_mu = F.conv2d(x, weight=self.w.mu)
             w_std = torch.sqrt(1e-12 + F.conv2d(x.pow(2), weight=torch.exp(self.log_alpha) * self.w.mu.pow(2)))
 
-            output = w_mu + w_std * torch.randn(w_std.size()).to(w_std.device)
+            output = w_mu + w_std * torch.randn(w_std.size(), requires_grad=True).to(w_std.device)
 
             return output, self.w.weights, b
 
-    def _mmd_forward(self, x):
+    def _mmd_forward(self, x, calculate_divergence):
         o, w, b = self._forward(x)
 
         mmd_w = torch.tensor(0.0).to(x.device)  # .float()
         mmd_b = torch.tensor(0.0).to(x.device)  # .float()
 
-        if self.training:
+        if self.training and calculate_divergence:
             w = torch.flatten(w, 1)
             mmd_w = compute_mmd(w, self.prior_w.sample(w.size()).to(w.device))
 
@@ -72,12 +92,12 @@ class BayesianCNNLayer(nn.Module):
 
         return o, mmd_w + mmd_b
 
-    def _kl_forward(self, x):
+    def _kl_forward(self, x, calculate_divergence):
         o, w, b = self._forward(x)
         log_post = torch.tensor(0.0)
         log_prior = torch.tensor(0.0)
 
-        if self.training:
+        if self.training and calculate_divergence:
             log_post = self.w.posterior_log_prob(w).sum()
             log_prior = self.prior_w.log_prob(w).sum()
 
@@ -87,11 +107,11 @@ class BayesianCNNLayer(nn.Module):
 
         return o, log_prior, log_post
 
-    def forward(self, x):
+    def forward(self, x, calculate_divergence=True):
         if self.divergence == 'kl':
-            return self._kl_forward(x)
+            return self._kl_forward(x, calculate_divergence)
         if self.divergence == 'mmd':
-            return self._mmd_forward(x)
+            return self._mmd_forward(x, calculate_divergence)
 
     def extra_repr(self):
         return 'input: {}, output: {}, kernel_size: {}, bias: {}'.format(self.in_channels, self.kernels,
@@ -104,6 +124,27 @@ class BayesianLinearLayer(nn.Module):
                  local_rep_trick=False):
 
         super().__init__()
+
+        if mu_init is None:
+            #     # std = 1/np.sqrt(in_size)
+            #     # std *= 3
+            #     std = np.sqrt(2/in_size)*3
+            #     mu_init = (-std, std)
+            #     print(mu_init)
+
+            # std = 1/np.sqrt(std)
+            std = np.sqrt(2/in_size)
+
+            # std *= 3
+            mu_init = (-std, std)
+            # rho_init = np.log(np.exp(2/(3*in_size)) - 1)
+
+        if rho_init is None:
+            rho_init = -3
+
+        # std = np.sqrt(2/in_size)
+        # mu_init = [-std, std]
+        # rho_init = -3
 
         divergence = divergence.lower()
         if divergence not in ['mmd', 'kl']:
@@ -125,7 +166,7 @@ class BayesianLinearLayer(nn.Module):
                                         mu_initialization=mu_init, rho_initialization=rho_init)
 
         if local_rep_trick:
-            self.log_alpha = Parameter(torch.Tensor(1, 1))
+            self.log_alpha = nn.Parameter(torch.zeros((1, 1)).uniform_(*mu_init))
 
         self.w_w = None
         self.b_w = None
@@ -156,13 +197,13 @@ class BayesianLinearLayer(nn.Module):
 
             return w_out, self.w.weights, b
 
-    def _mmd_forward(self, x):
+    def _mmd_forward(self, x, calculate_divergence):
         o, w, b = self._forward(x)
 
         mmd_w = torch.tensor(0.0)  # .float()
         mmd_b = torch.tensor(0.0)  # .float()
 
-        if self.training:
+        if self.training and calculate_divergence:
             mmd_w = compute_mmd(w, self.prior_w.sample(w.size()).to(w.device))
 
             if b is not None:
@@ -171,12 +212,12 @@ class BayesianLinearLayer(nn.Module):
 
         return o, mmd_w + mmd_b
 
-    def _kl_forward(self, x):
+    def _kl_forward(self, x, calculate_divergence):
         o, w, b = self._forward(x)
         log_post = torch.tensor(0.0)
         log_prior = torch.tensor(0.0)
 
-        if self.training:
+        if self.training and calculate_divergence:
             log_post = self.w.posterior_log_prob(w).sum()
             log_prior = self.prior_w.log_prob(w).sum()
 
@@ -244,11 +285,11 @@ class BayesianLinearLayer(nn.Module):
     def posterior_distribution(self):
         return self.w.posterior_distribution(), self.b.posterior_distribution()
 
-    def forward(self, x):
+    def forward(self, x, calculate_divergence=True):
         if self.divergence == 'kl':
-            return self._kl_forward(x)
+            return self._kl_forward(x, calculate_divergence)
         if self.divergence == 'mmd':
-            return self._mmd_forward(x)
+            return self._mmd_forward(x, calculate_divergence)
 
     def extra_repr(self):
         return 'input: {}, output: {}, bias: {}'.format(self.in_size, self.out_size,
@@ -262,11 +303,16 @@ class BayesianParameters(nn.Module):
         if mu_initialization is None:
             self.mu = nn.Parameter(torch.randn(size))
         elif isinstance(mu_initialization, (list, tuple)):
+            if len(mu_initialization) != 2:
+                raise ValueError("If you want to initialize mu uniformly,"
+                                 " mu_init should have len=2, {} given".format(mu_initialization))
             self.mu = nn.Parameter(torch.zeros(size).uniform_(*mu_initialization))
         elif isinstance(mu_initialization, (float, int)):
             self.mu = nn.Parameter(torch.ones(size) * mu_initialization)
         else:
             raise ValueError("Error mu")
+
+        # self.mu = self.mu.div(self.mu.norm(p=2, dim=0, keepdim=True))
 
         if rho_initialization is None:
             self.rho = nn.Parameter(torch.randn(size))
@@ -279,11 +325,14 @@ class BayesianParameters(nn.Module):
 
     @property
     def weights(self):
-        return self.mu + self.sigma * Normal(0, 1).sample(self.mu.shape).to(self.mu.device)
+        sigma = self.sigma
+        r = self.mu + sigma * torch.randn(self.mu.shape, requires_grad=True).to(self.mu.device)
+        return r
 
     @property
     def sigma(self):
-        return torch.log(1 + torch.exp(self.rho))
+        return F.softplus(self.rho)
+        # return torch.log(1 + torch.exp(self.rho))
 
     def prior(self, prior: torch.distributions, w, log=True):
         if log:
@@ -336,48 +385,50 @@ def pairwise_distances(x, y):
     return torch.clamp(dist, 0.0, np.inf)
 
 
-def compute_mmd(x, y):
-    # dim = x.size(1)
-    # xx, yy, xy = torch.mm(x, x.t()), torch.mm(y, y.t()), torch.mm(x, y.t())
-    xx = pdist(x, x)**2
-    yy = pdist(y, y)**2
-    xy = pdist(x, y)**2
+def compute_mmd(x, y, type='inverse'):
+    if type == 'rbf':
+        xxd = pdist(x, x)**2
+        yyd = pdist(y, y)**2
+        xyd = pdist(x, y)**2
 
-    # print(torch.trace())
-    xs, ys = xx.shape[0], yy.shape[0]
+        xs, ys = xxd.shape[0], yyd.shape[0]
 
-    xx = torch.exp(-xx/xs).sum() - xx.trace()
-    yy = torch.exp(-yy/xs).sum() - yy.trace()
-    xy = torch.exp(-xy/xs).sum()
+        gamma = 1/xs
+        xx = torch.exp(-xxd/gamma)
+        xx = xx.sum() - xx.trace()
 
-    mmd = (2/(ys*xs)) * xy + (1/(xs**2)) * xx + (1/(ys**2)) * yy
+        yy = torch.exp(-yyd/gamma)
+        yy = yy.sum() - yy.trace()
 
-    # xx = xx - torch.trace(xx)
-    # yy = yy - torch.trace(yy)
-    #
-    # xx =
+        xy = torch.exp(-xyd/gamma).sum()
 
-    # rx = (xx.diag().unsqueeze(0).expand_as(xx))
-    # ry = (yy.diag().unsqueeze(0).expand_as(yy))
+        mmd = (2 / (ys * xs)) * xy + (1 / (xs ** 2)) * xx + (1 / (ys ** 2)) * yy
+        return mmd
 
-    # dxx = rx.t() + rx - 2. * xx
-    # dyy = ry.t() + ry - 2. * yy
-    # dxy = rx.t() + ry - 2. * xy
+    if type == 'inverse':
+        xxd = pdist(x, x)**2
+        yyd = pdist(y, y)**2
+        xyd = pdist(x, y)**2
 
-    # print(xx.device)
-    # XX, YY, XY = (torch.zeros(xx.shape).to(x.device),
-    #               torch.zeros(xx.shape).to(x.device),
-    #               torch.zeros(xx.shape).to(x.device))
-    # #
-    # for a in [0.05, 0.1, 0.2, 0.9]:
-    #     XX += a**2 * (a**2 + dxx)**-1
-    #     YY += a**2 * (a**2 + dyy)**-1
-    #     XY += a**2 * (a**2 + dxy)**-1
+        xs, ys = xxd.shape[0], yyd.shape[0]
 
-    # # for a in [dim]:
-    # XX = torch.exp(-xx/dim).mean()
-    # YY = torch.exp(-yy/dim).mean()
-    # XY = torch.exp(-xy/dim).mean()
+        XX, YY, XY = 0, 0, 0
 
-    # return torch.mean(XX + YY - 2. * XY)
-    return mmd
+        for a in [0.05, 0.2, 0.9]:
+            a = a ** 2
+            xxk = a * ((a + xxd) ** -1)
+            yyk = a * ((a + yyd) ** -1)
+            xyk = a * ((a + xyd) ** -1)
+
+            xxk = xxk.sum() - xxk.trace()
+            yyk = yyk.sum() - yyk.trace()
+            xyk = xyk.sum()
+
+            XX += xxk
+            YY += yyk
+            XY += xyk
+
+        mmd = (2 / (ys * xs)) * XY + (1 / (xs ** 2)) * XX + (1 / (ys ** 2)) * YY
+        return mmd
+
+    return None

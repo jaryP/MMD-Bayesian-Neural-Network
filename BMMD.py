@@ -1,12 +1,12 @@
-import numpy as np
 from itertools import chain
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from base import Network, Gaussian, Wrapper, Flatten, get_bayesian_network
+from base import Network, Gaussian, Wrapper, get_bayesian_network
 from bayesian_utils import BayesianCNNLayer, BayesianLinearLayer
 
 
@@ -67,17 +67,18 @@ from bayesian_utils import BayesianCNNLayer, BayesianLinearLayer
 #     xy_kernel = compute_kernel(x, y)
 #     return x_kernel + y_kernel - 2 * xy_kernel
 
+
 class BMMD(Network):
 
     def __init__(self, sample, classes, topology=None, prior=None, mu_init=None, rho_init=None,
-                 local_trick=False, **kwargs):
-        super().__init__()
+                 local_trick=False, regression=False, **kwargs):
+        super().__init__(classes, regression)
 
-        if mu_init is None:
-            mu_init = (-0.6, 0.6)
+        # if mu_init is None:
+        #     mu_init = (-0.6, 0.6)
 
-        if rho_init is None:
-            rho_init = -6
+        # if rho_init is None:
+        #     rho_init = -3
 
         if topology is None:
             topology = [400, 400]
@@ -85,9 +86,11 @@ class BMMD(Network):
         if prior is None:
             prior = Gaussian(0, 10)
 
+        self.calculate_mmd = True
         self._prior = prior
         self.features = get_bayesian_network(topology, sample, classes,
                                              mu_init, rho_init, prior, 'mmd', local_trick)
+
         # ##################### non abbandonarmi più jary!!!!
         # ##################### Scusa :'(
 
@@ -98,11 +101,8 @@ class BMMD(Network):
             if not isinstance(i, (BayesianLinearLayer, BayesianCNNLayer)):
                 x = i(x)
             else:
-                x, m = i(x)
+                x, m = i(x, self.calculate_mmd)
                 mmd += m
-
-            if j < len(self.features)-1:
-                x = torch.relu(x)
 
         return x, mmd
 
@@ -137,7 +137,7 @@ class Trainer(Wrapper):
         losses = []
 
         self.model.train()
-        progress_bar = tqdm(enumerate(self.train_data), total=len(self.train_data), disable=False)
+        progress_bar = tqdm(enumerate(self.train_data), total=len(self.train_data), disable=True, leave=False)
         progress_bar.set_postfix(mmd_loss='not calculated', ce_loss='not calculated')
 
         train_true = []
@@ -145,35 +145,47 @@ class Trainer(Wrapper):
 
         M = len(self.train_data)
         a = np.asarray([2 ** (M - i - 1) for i in range(M + 1)])
-        b = 2 ** (M - 1)
+        b = 2 ** M - 1
 
         pi = a / b
+        self.model.calculate_mmd = True
 
-        for batch, (x_train, y_train) in progress_bar:
+        for batch, (x, y) in progress_bar:
 
-            train_true.extend(y_train.tolist())
+            train_true.extend(y.tolist())
 
+            y = y.to(self.device)
+            x = x.to(self.device)
             self.optimizer.zero_grad()
 
-            out, mmd = self.model(x_train.to(self.device), samples=samples)
+            out, mmd = self.model(x, samples=samples)
             out = out.mean(0)
-            # print(mmd)
-            # mmd = mmd*-1
-            # mmd *= 1000
-            # mmd *= pi[batch]
-            mmd /= x_train.shape[0]
+            mmd /= x.shape[0]
+            mmd *= pi[batch]
 
-            max_class = F.softmax(out, -1).argmax(dim=-1)
-            train_pred.extend(max_class.tolist())
+            if mmd == 0:
+                self.model.calculate_mmd = False
 
-            ce = F.cross_entropy(out, y_train.to(self.device), reduction='mean')
-            loss = ce + mmd
-            # loss = mmd
+            if self.regression:
+                if self.model.classes == 1:
+                    noise = self.model.noise.exp()
+                    x = out
+                    loss = self.loss_function(x, y, noise)
+                else:
+                    loss = self.loss_function(out[:, :1], y, out[:, 1:].exp())#/x.shape[0]
+            else:
+                loss = self.loss_function(out, y)
+                out = out.argmax(dim=-1)
+
+            train_pred.extend(out.tolist())
+
+            # ce = F.cross_entropy(out, y.to(self.device), reduction='mean')
+            loss += mmd
             losses.append(loss.item())
             loss.backward()
             self.optimizer.step()
 
-            progress_bar.set_postfix(ce_loss=ce.item(), mmd_loss=mmd.item())
+            # progress_bar.set_postfix(ce_loss=ce.item(), mmd_loss=mmd.item())
 
         return losses, (train_true, train_pred)
 
@@ -184,10 +196,10 @@ class Trainer(Wrapper):
 
         self.model.eval()
         with torch.no_grad():
-            for i, (x_test, y_test) in enumerate(self.test_data):
-                test_true.extend(y_test.tolist())
+            for i, (x, y) in enumerate(self.test_data):
+                test_true.extend(y.tolist())
 
-                out = self.model.eval_forward(x_test.to(self.device), samples=samples)
+                out = self.model.eval_forward(x.to(self.device), samples=samples)
                 out = out.mean(0)
                 out = out.argmax(dim=-1)
                 test_pred.extend(out.tolist())
@@ -201,3 +213,109 @@ class Trainer(Wrapper):
 
     def snr_test(self, percentiles: list):
         return None
+
+    # def rotation_test(self, samples=1):
+    #     ts_copy = copy(self.test_data.dataset.transform)
+    #
+    #     HS = []
+    #     DIFF = []
+    #     scores = []
+    #     self.model.eval()
+    #
+    #     for angle in self.rotations:
+    #         ts = T.Compose([AngleRotation(angle), ts_copy])
+    #         self.test_data.dataset.transform = ts
+    #
+    #         H = []
+    #         pred_label = []
+    #         true_label = []
+    #
+    #         diff = []
+    #
+    #         outs = []
+    #         self.model.eval()
+    #         with torch.no_grad():
+    #             for i, (x, y) in enumerate(self.test_data):
+    #                 true_label.extend(y.tolist())
+    #
+    #                 out = self.model.eval_forward(x.to(self.device), samples=samples)
+    #
+    #                 outs.append(out.cpu().numpy())
+    #
+    #                 out_m = out.mean(0)
+    #                 pred_label.extend(out_m.argmax(dim=-1).tolist())
+    #
+    #                 top_score, top_label = torch.topk(F.softmax(out.mean(0), -1), 2)
+    #
+    #                 H.extend(top_score[:, 0].tolist())
+    #                 diff.extend(((top_score[:, 0] - top_score[:, 1]) ** 2).tolist())
+    #
+    #         p_hat = np.asarray(H)
+    #
+    #         mean_diff = np.mean(diff)
+    #
+    #         epistemic = np.mean(p_hat ** 2, axis=0) - np.mean(p_hat, axis=0) ** 2
+    #         aleatoric = np.mean(p_hat * (1 - p_hat), axis=0)
+    #
+    #         entropy = aleatoric + epistemic
+    #
+    #         # HS.append((np.mean(correct_h), np.mean(incorrect_h)))
+    #
+    #         # HS.append(np.mean(H))
+    #
+    #         HS.append(entropy)
+    #         DIFF.append(mean_diff)
+    #         scores.append(metrics.f1_score(true_label, pred_label, average='micro'))
+    #
+    #     self.test_data.dataset.transform = ts_copy
+    #     return HS, DIFF, scores
+
+    # def attack_test(self, samples=1):
+    #     HS = []
+    #     scores = []
+    #
+    #     self.model.eval()
+    #     for eps in self.epsilons:
+    #
+    #         H = []
+    #         pred_label = []
+    #         true_label = []
+    #
+    #         # self.model.eval()
+    #         for i, (x, y) in enumerate(self.test_data):
+    #             true_label.extend(y.tolist())
+    #
+    #             x = x.to(self.device)
+    #             y = y.to(self.device)
+    #
+    #             self.model.zero_grad()
+    #             x.requires_grad = True
+    #             out, mmd = self.model(x, samples=samples)
+    #             out = out.mean(0)
+    #
+    #             pred = (out.mean(0).argmax(dim=-1) == y).tolist()
+    #
+    #             ce = F.cross_entropy(out, y, reduction='mean')
+    #             # loss = ce + mmd
+    #             ce.backward()
+    #
+    #             perturbed_data = fgsm_attack(x, eps)
+    #             out = self.model.eval_forward(perturbed_data, samples=samples)
+    #             # out = out.mean(0)
+    #             pred_label.extend(out.mean(0).argmax(dim=-1).tolist())
+    #
+    #             # a = compute_entropy(F.softmax(out, -1), True).tolist()
+    #
+    #             # print(a)
+    #             # print(pred)
+    #             # print([a[i] for i in range(len(a)) if pred[i] == 0 ], np.mean(a))
+    #             # input()
+    #             entropy = compute_entropy(F.softmax(out, -1)).mean(0)
+    #
+    #             # H.extend(compute_entropy(entropy).tolist())
+    #             # H.extend(compute_entropy(F.softmax(out, -1)).tolist())
+    #
+    #         scores.append(metrics.f1_score(true_label, pred_label, average='micro'))
+    #         HS.append(np.mean(H))
+    #
+    #     return HS, scores

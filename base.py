@@ -1,10 +1,16 @@
-import numpy as np
 from abc import ABC, abstractmethod
-from typing import Tuple
+from copy import copy
 
+import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.transforms as T
+from sklearn import metrics
 from torch.distributions import Normal
+
+from bayesian_utils import BayesianCNNLayer, BayesianLinearLayer
+
 
 #
 # def pairwise_distances(x, y):
@@ -29,7 +35,152 @@ from torch.distributions import Normal
 #     return x_kernel + y_kernel - 2 * xy_kernel
 
 
-from bayesian_utils import BayesianCNNLayer, BayesianLinearLayer
+class AngleRotation:
+    def __init__(self, angle):
+        self.angle = angle
+
+    def __call__(self, x):
+        return T.functional.rotate(x, self.angle)
+
+
+class AddNoise:
+    def __init__(self, noise):
+        self.noise = noise
+
+    def __call__(self, x):
+        return x + torch.randn(x.size()) * self.noise
+
+
+# FGSM attack code
+def fgsm_attack(image, epsilon):
+    if epsilon == 0:
+        return image
+    # Collect the element-wise sign of the data gradient
+    sign_data_grad = image.grad.data.sign()
+    # Create the perturbed image by adjusting each pixel of the input image
+    perturbed_image = image + epsilon*sign_data_grad
+    # Adding clipping to maintain [0,1] range
+    perturbed_image = torch.clamp(perturbed_image, 0, 1)
+    # Return the perturbed image
+    # print(epsilon, perturbed_image.mean(), image.mean())
+    return perturbed_image
+
+
+def log_gaussian_loss(out_dim):
+    # def loss_function(x, y, sigma):
+    #     log_coeff = -1 * torch.log(sigma + 1e-12) - 0.5 * ((x - y) ** 2 / sigma ** 2)
+    #     return (- log_coeff).sum()
+
+    def loss_function(x, y, sigma):
+        exponent = -0.5 * (x - y) ** 2 / sigma ** 2
+        log_coeff = -torch.log(sigma+1e-12) - 0.5 * np.log(2 * np.pi)
+        return -(log_coeff + exponent).sum()
+
+    return loss_function
+
+
+def cross_entropy_loss(reduction):
+    def loss_function(x, y):
+        return F.cross_entropy(x, y, reduction=reduction)
+    return loss_function
+
+
+def epistemic_aleatoric_uncertainty(x):
+    t = x.shape[0]
+    classes = x.shape[-1]
+    # x = np.e ** x / sum(np.e ** x, -1)
+    # x = x.mean(0)
+    # x[[0, 1, 2]] = x[]
+    x = np.moveaxis(x, 0, 1)
+
+    # x = torch.nn.functional.softmax(x, -1)
+    # print(x.shape, x[0])
+    # p_hat = x.detach().cpu().numpy()
+    # aleatorics = []
+    unc = []
+
+    for p in x:
+        aleatoric = np.zeros((classes, classes))
+        epistemic = np.zeros((classes, classes))
+
+        np.argmax(p)
+        # print(p.shape)
+        # print(p)
+        p = np.e ** p / sum(np.e ** p, 1)
+        # print(p)
+        # print(p.sum(-1))
+        # input()
+        p_mean = p.mean(0)
+
+        for p_hat in p:
+            # print(np.e ** p_hat / sum(np.e ** p_hat, -1), np.sum(np.e ** p_hat / sum(np.e ** p_hat, -1)))
+            # print(p_hat, p_hat.sum())
+            a = np.diag(p_hat) - np.outer(p_hat, p_hat)/p_hat.shape[0]
+
+            # print(np.argmax(p))
+            # print(a[np.argmax(p), np.argmax(p)])
+            aleatoric += a
+
+            p_hat -= p_mean
+            epistemic += np.outer(p_hat, p_hat)
+
+        unc.append((np.mean(aleatoric/t), np.mean(epistemic/t)))
+        # print(np.mean(aleatoric/t), np.mean(epistemic/t))
+        # input()
+        # p = p_hat[i]
+        # x = x.mean(0)
+
+        # p_hat = x
+        # # p_hat = np.max(x, -1)
+        # # print(p_hat)
+        # epistemic = np.mean((p_hat) ** 2, axis=0) - np.mean((p_hat), axis=0) ** 2
+        # # epistemic = np.mean((1-p_hat) ** 2, axis=0) - np.mean((1-p_hat), axis=0) ** 2
+        # # epistemic += epistemic
+        # print (epistemic)
+        # aleatoric = np.mean((p_hat) * (1-(p_hat)), axis = 0)
+        # # aleatoric = np.mean((1-p_hat), axis = 0) ** 2
+        # # aleatoric += aleatoric
+        #
+        # print(epistemic, aleatoric)
+        # input()
+    # res = np.mean(x, axis=0)
+    # aleatoric = np.diag(res) - res.T.dot(res) / res.shape[0]
+    # input(aleatoric.sum())
+
+    # p = p
+    # aleatoric = 0
+    # for i in range(len(x)):
+    # print()
+    # print(np.diag(p_hat).shape)
+    # aleatoric = np.diag(p_hat) - p_hat.T.dot(p_hat)/p_hat.shape[0]
+    # aleatoric /= t
+    # input(aleatoric)
+    #
+    # epistemic = np.mean(p_hat ** 2, axis=0) - np.mean(p_hat, axis=0) ** 2
+    # aleatoric = np.mean(p_hat * (1 - p_hat), axis=0)
+    #
+    # print(epistemic, aleatoric)
+    # # aleatorics.append(ale)
+    # ## input(aleatoric)
+    # # input(aleatoric)
+    #
+    # p_bar = np.sum(p_hat, keepdims=True, axis=-1)/t
+    # diff = p_hat - p_bar
+    #
+    # epistemic = diff.T.dot(diff)/p_bar.shape[0]
+    #
+    # print(np.sum(aleatoric, keepdims=True), np.sum(epistemic, keepdims=True))
+    # input()
+    return np.asarray(unc)
+
+
+def compute_entropy(preds, sum=True):
+    l = torch.log10(preds + 1e-12) * preds
+    if sum:
+        return -torch.sum(l, 1)
+    else:
+        return -l
+    # return -(torch.log2(preds + 1e-10) * preds).sum(dim=1)
 
 
 def get_bayesian_network(topology, input_image, classes, mu_init, rho_init, prior, divergence, local_trick):
@@ -45,6 +196,9 @@ def get_bayesian_network(topology, input_image, classes, mu_init, rho_init, prio
             l = torch.nn.MaxPool2d(i[1])
             input_image = l(input_image)
             prev = input_image.shape[1]
+
+        elif isinstance(i, str) and i.lower() == 'relu':
+            l = torch.nn.ReLU()
 
         elif isinstance(i, float):
             l = torch.nn.Dropout(p=0.5)
@@ -64,7 +218,7 @@ def get_bayesian_network(topology, input_image, classes, mu_init, rho_init, prio
             prev = input_image.shape[1]
 
         elif isinstance(i, int):
-            if j > 0 and not isinstance(topology[j - 1], int):
+            if j > 0 and not isinstance(topology[j - 1], (int, float, str)):
                 input_image = torch.flatten(input_image, 1)
                 prev = input_image.shape[-1]
                 features.append(Flatten())
@@ -104,6 +258,9 @@ def get_network(topology, input_image, classes):
             input_image = l(input_image)
             prev = input_image.shape[1]
 
+        elif isinstance(i, str) and i.lower() == 'relu':
+            l = torch.nn.ReLU()
+
         elif isinstance(i, float):
             l = torch.nn.Dropout(p=0.5)
 
@@ -120,7 +277,7 @@ def get_network(topology, input_image, classes):
             prev = input_image.shape[1]
 
         elif isinstance(i, int):
-            if j > 0 and not isinstance(topology[j - 1], int):
+            if j > 0 and not isinstance(topology[j - 1], (int, float, str)):
                 input_image = torch.flatten(input_image, 1)
                 prev = input_image.shape[-1]
                 features.append(Flatten())
@@ -128,8 +285,9 @@ def get_network(topology, input_image, classes):
             size = i
             l = torch.nn.Linear(prev, i)
             prev = size
-
         else:
+            # 'Supported type for topology: \n' \
+            # 'List: []'
             raise ValueError('Topology should be tuple for cnn layers, formatted as (num_kernels, kernel_size), '
                              'pooling layer, formatted as tuple ([\'MP\', \'AP\'], kernel_size, stride) '
                              'or integer, for linear layer. {} was given'.format(i))
@@ -190,6 +348,14 @@ class ScaledMixtureGaussian(object):
 # Utils
 
 class Network(nn.Module, ABC):
+    def __init__(self, classes, regression=False):
+        super().__init__()
+        self.classes = classes
+        self.regression = regression
+
+        if regression:
+            # if classes == 1:
+            self.noise = nn.Parameter(torch.tensor(0.0))
 
     @abstractmethod
     def layers(self):
@@ -201,6 +367,9 @@ class Network(nn.Module, ABC):
 
 
 class Wrapper(ABC):
+    epsilons = [0,]# 0.01] #, 0.05, .1, .2, .5, .8]
+    rotations = [0]# 15] #, 30, 45, 90, 180, 270]
+
     def __init__(self, model: nn.Module, train_data, test_data, optimizer):
         self.model = model
         self.train_data = train_data
@@ -208,19 +377,136 @@ class Wrapper(ABC):
         self.optimizer = optimizer
         self.device = next(model.parameters()).device
 
+        self.regression = model.regression
+
+        if model.regression:
+            self.loss_function = log_gaussian_loss(model.classes)
+        else:
+            self.loss_function = cross_entropy_loss('mean')
+
     def train_step(self, **kwargs):
         losses, train_res = self.train_epoch(**kwargs)
         test_res = self.test_evaluation(**kwargs)
         return losses, train_res, test_res
 
-    @abstractmethod
-    def train_epoch(self, **kwargs) -> Tuple[list, Tuple[list, list]]:
+    def ce_loss(self, x, y):
         pass
 
     @abstractmethod
-    def test_evaluation(self, **kwargs) -> Tuple[list, list]:
+    def train_epoch(self, **kwargs):
         pass
 
     @abstractmethod
-    def snr_test(self, percentiles: list) -> list:
+    def test_evaluation(self, **kwargs):
         pass
+
+    @abstractmethod
+    def snr_test(self, percentiles: list):
+        pass
+
+    # @abstractmethod
+    # def attack_test(self, **kwargs):
+    #     pass
+
+    def rotation_test(self, samples=1):
+
+        ts_copy = copy(self.test_data.dataset.transform)
+
+        HS = []
+        DIFF = []
+        scores = []
+        self.model.eval()
+
+        for angle in self.rotations:
+            ts = T.Compose([AngleRotation(angle), ts_copy])
+            self.test_data.dataset.transform = ts
+
+            H = []
+            pred_label = []
+            true_label = []
+            diff = []
+
+            self.model.eval()
+            with torch.no_grad():
+                for i, (x, y) in enumerate(self.test_data):
+                    true_label.extend(y.tolist())
+
+                    out = self.model.eval_forward(x.to(self.device), samples=samples)
+
+                    out_m = out.mean(0)
+                    pred_label.extend(out_m.argmax(dim=-1).tolist())
+
+                    top_score, top_label = torch.topk(F.softmax(out.mean(0), -1), 2)
+
+                    H.extend(top_score[:, 0].tolist())
+                    diff.extend(((top_score[:, 0] - top_score[:, 1]) ** 2).tolist())
+
+            p_hat = np.asarray(H)
+
+            mean_diff = np.mean(diff)
+
+            epistemic = np.mean(p_hat ** 2, axis=0) - np.mean(p_hat, axis=0) ** 2
+            aleatoric = np.mean(p_hat * (1 - p_hat), axis=0)
+
+            entropy = aleatoric + epistemic
+
+            HS.append((entropy, np.mean(H)))
+            DIFF.append(mean_diff)
+            scores.append(metrics.f1_score(true_label, pred_label, average='micro'))
+
+        self.test_data.dataset.transform = ts_copy
+        return HS, DIFF, scores
+
+    def attack_test(self, samples=1):
+
+        HS = []
+        DIFF = []
+        scores = []
+
+        self.model.eval()
+        for eps in self.epsilons:
+
+            H = []
+            pred_label = []
+            true_label = []
+            diff = []
+
+            self.model.eval()
+            for i, (x, y) in enumerate(self.test_data):
+                true_label.extend(y.tolist())
+
+                x = x.to(self.device)
+                y = y.to(self.device)
+
+                self.model.zero_grad()
+                x.requires_grad = True
+                out = self.model.eval_forward(x.to(self.device), samples=samples)
+
+                ce = F.cross_entropy(out.mean(0), y, reduction='mean')
+                ce.backward()
+
+                perturbed_data = fgsm_attack(x, eps)
+                out = self.model.eval_forward(perturbed_data, samples=samples)
+
+                out_m = out.mean(0)
+                pred_label.extend(out_m.argmax(dim=-1).tolist())
+
+                top_score, top_label = torch.topk(F.softmax(out.mean(0), -1), 2)
+
+                H.extend(top_score[:, 0].tolist())
+                diff.extend(((top_score[:, 0] - top_score[:, 1]) ** 2).tolist())
+
+            p_hat = np.asarray(H)
+
+            mean_diff = np.mean(diff)
+
+            epistemic = np.mean(p_hat ** 2, axis=0) - np.mean(p_hat, axis=0) ** 2
+            aleatoric = np.mean(p_hat * (1 - p_hat), axis=0)
+
+            entropy = aleatoric + epistemic
+
+            HS.append((entropy, np.mean(H)))
+            DIFF.append(mean_diff)
+            scores.append(metrics.f1_score(true_label, pred_label, average='micro'))
+
+        return HS, DIFF, scores
