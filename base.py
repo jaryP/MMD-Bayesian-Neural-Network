@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 from sklearn import metrics
 from torch.distributions import Normal
+from tqdm import tqdm
 
 from bayesian_utils import BayesianCNNLayer, BayesianLinearLayer
 
@@ -183,12 +184,15 @@ def compute_entropy(preds, sum=True):
     # return -(torch.log2(preds + 1e-10) * preds).sum(dim=1)
 
 
-def get_bayesian_network(topology, input_image, classes, mu_init, rho_init, prior, divergence, local_trick):
+def get_bayesian_network(topology, input_image, classes, mu_init, rho_init, prior, divergence, local_trick,
+                         bias=True, **kwargs):
+
     features = torch.nn.ModuleList()
     # self._prior = prior
-
+    # print(mu_init)
     prev = input_image.shape[0]
     input_image = input_image.unsqueeze(0)
+    ll_conv = False
 
     for j, i in enumerate(topology):
 
@@ -196,6 +200,7 @@ def get_bayesian_network(topology, input_image, classes, mu_init, rho_init, prio
             l = torch.nn.MaxPool2d(i[1])
             input_image = l(input_image)
             prev = input_image.shape[1]
+            ll_conv = True
 
         elif isinstance(i, str) and i.lower() == 'relu':
             l = torch.nn.ReLU()
@@ -207,25 +212,28 @@ def get_bayesian_network(topology, input_image, classes, mu_init, rho_init, prio
             l = torch.nn.AvgPool2d(i[1])
             input_image = l(input_image)
             prev = input_image.shape[1]
+            ll_conv = True
 
         elif isinstance(i, (tuple, list)):
             size, kernel_size = i
             l = BayesianCNNLayer(in_channels=prev, kernels=size, kernel_size=kernel_size,
                                  mu_init=mu_init, divergence=divergence, local_rep_trick=local_trick,
-                                 rho_init=rho_init, prior=prior)
+                                 rho_init=rho_init, prior=prior, **kwargs)
 
             input_image = l(input_image)[0]
             prev = input_image.shape[1]
 
         elif isinstance(i, int):
-            if j > 0 and not isinstance(topology[j - 1], (int, float, str)):
+            if ll_conv:
                 input_image = torch.flatten(input_image, 1)
                 prev = input_image.shape[-1]
                 features.append(Flatten())
+            ll_conv = False
 
             size = i
             l = BayesianLinearLayer(in_size=prev, out_size=size, mu_init=mu_init, divergence=divergence,
-                                    rho_init=rho_init, prior=prior, local_rep_trick=local_trick)
+                                    rho_init=rho_init, prior=prior, local_rep_trick=local_trick, use_bias=bias,
+                                    **kwargs)
             prev = size
 
         else:
@@ -241,15 +249,16 @@ def get_bayesian_network(topology, input_image, classes, mu_init, rho_init, prio
         features.append(Flatten())
 
     features.append(BayesianLinearLayer(in_size=prev, out_size=classes, mu_init=mu_init, rho_init=rho_init,
-                                        prior=prior, divergence=divergence, local_rep_trick=local_trick))
+                                        prior=prior, divergence=divergence, local_rep_trick=local_trick, **kwargs))
     return features
 
 
-def get_network(topology, input_image, classes):
+def get_network(topology, input_image, classes, bias=True):
     features = torch.nn.ModuleList()
 
     prev = input_image.shape[0]
     input_image = input_image.unsqueeze(0)
+    ll_conv = False
 
     for j, i in enumerate(topology):
 
@@ -257,6 +266,7 @@ def get_network(topology, input_image, classes):
             l = torch.nn.MaxPool2d(i[1])
             input_image = l(input_image)
             prev = input_image.shape[1]
+            ll_conv = True
 
         elif isinstance(i, str) and i.lower() == 'relu':
             l = torch.nn.ReLU()
@@ -268,20 +278,23 @@ def get_network(topology, input_image, classes):
             l = torch.nn.AvgPool2d(i[1])
             input_image = l(input_image)
             prev = input_image.shape[1]
+            ll_conv = True
 
         elif isinstance(i, (tuple, list)):
             size, kernel_size = i
-            l = torch.nn.Conv2d(in_channels=prev, out_channels=size, kernel_size=kernel_size)
+            l = torch.nn.Conv2d(in_channels=prev, out_channels=size, kernel_size=kernel_size, bias=bias)
 
             input_image = l(input_image)
             prev = input_image.shape[1]
+            ll_conv = True
 
         elif isinstance(i, int):
-            if j > 0 and not isinstance(topology[j - 1], (int, float, str)):
+            if ll_conv:
                 input_image = torch.flatten(input_image, 1)
                 prev = input_image.shape[-1]
                 features.append(Flatten())
 
+            ll_conv = False
             size = i
             l = torch.nn.Linear(prev, i)
             prev = size
@@ -294,7 +307,7 @@ def get_network(topology, input_image, classes):
 
         features.append(l)
 
-    if isinstance(topology[-1], (tuple, list)):
+    if ll_conv:
         input_image = torch.flatten(input_image, 1)
         prev = input_image.shape[-1]
         features.append(Flatten())
@@ -326,6 +339,20 @@ class Gaussian(object):
 
     def log_prob(self, x):
         return self.inner_gaussian.log_prob(x)
+
+
+class Laplace(object):
+    def __init__(self, mu=0, scale=1):
+        self.mu = mu
+        self.scale = scale
+        self.distribution = torch.distributions.laplace.Laplace(mu, scale)
+
+    def sample(self, size):
+        return self.distribution.rsample(size)
+        # return self.mu + self.sigma * Normal(0, 1).sample(size)
+
+    def log_prob(self, x):
+        return self.distribution.log_prob(x)
 
 
 class ScaledMixtureGaussian(object):
@@ -367,8 +394,8 @@ class Network(nn.Module, ABC):
 
 
 class Wrapper(ABC):
-    epsilons = [0,]# 0.01] #, 0.05, .1, .2, .5, .8]
-    rotations = [0]# 15] #, 30, 45, 90, 180, 270]
+    epsilons = [0, 0.01] #, 0.05, .1, .2, .5, .8]
+    rotations = [0, 15] #, 30, 45, 90, 180, 270]
 
     def __init__(self, model: nn.Module, train_data, test_data, optimizer):
         self.model = model
@@ -417,7 +444,7 @@ class Wrapper(ABC):
         scores = []
         self.model.eval()
 
-        for angle in self.rotations:
+        for angle in tqdm(self.rotations, desc='Rotation test'):
             ts = T.Compose([AngleRotation(angle), ts_copy])
             self.test_data.dataset.transform = ts
 
@@ -464,7 +491,7 @@ class Wrapper(ABC):
         scores = []
 
         self.model.eval()
-        for eps in self.epsilons:
+        for eps in tqdm(self.epsilons, desc='Attack test'):
 
             H = []
             pred_label = []

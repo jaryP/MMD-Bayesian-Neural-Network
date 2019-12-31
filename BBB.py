@@ -32,7 +32,7 @@ class BBB(Network):
 
         self._prior = prior
         self.features = get_bayesian_network(topology, sample, classes,
-                                             mu_init, rho_init, prior, 'kl', local_trick)
+                                             mu_init, rho_init, prior, 'kl', local_trick, bias=True)
 
     def _forward(self, x):
 
@@ -116,7 +116,7 @@ class Trainer(Wrapper):
             out, prior, post = self.model(x, samples=samples)
             out = out.mean(0)
 
-            logloss = (post - prior) * pi[batch] / x.shape[0]
+            logloss = (post - prior) * pi[batch] #/ x.shape[0]
 
             if logloss == 0:
                 self.model.calculate_kl = False
@@ -142,8 +142,8 @@ class Trainer(Wrapper):
 
             self.optimizer.step()
 
-            max_class = F.log_softmax(out, -1).argmax(dim=-1)
-            train_pred.extend(max_class.tolist())
+            # max_class = F.log_softmax(out, -1).argmax(dim=-1)
+            train_pred.extend(out.tolist())
 
         return losses, (train_true, train_pred)
 

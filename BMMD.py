@@ -89,7 +89,7 @@ class BMMD(Network):
         self.calculate_mmd = True
         self._prior = prior
         self.features = get_bayesian_network(topology, sample, classes,
-                                             mu_init, rho_init, prior, 'mmd', local_trick)
+                                             mu_init, rho_init, prior, 'mmd', local_trick, bias=True, **kwargs)
 
         # ##################### non abbandonarmi più jary!!!!
         # ##################### Scusa :'(
@@ -137,9 +137,10 @@ class Trainer(Wrapper):
         losses = []
 
         self.model.train()
-        progress_bar = tqdm(enumerate(self.train_data), total=len(self.train_data), disable=True, leave=False)
+        progress_bar = tqdm(enumerate(self.train_data), total=len(self.train_data), disable=False, leave=False)
         progress_bar.set_postfix(mmd_loss='not calculated', ce_loss='not calculated')
 
+        mmd_w = kwargs.get('weights', {}).get('mmd', 1)
         train_true = []
         train_pred = []
 
@@ -160,8 +161,10 @@ class Trainer(Wrapper):
 
             out, mmd = self.model(x, samples=samples)
             out = out.mean(0)
+            mmd *= mmd_w
             mmd /= x.shape[0]
-            mmd *= pi[batch]
+            #mmd *= pi[batch]
+            #mmd *= 1/M
 
             if mmd == 0:
                 self.model.calculate_mmd = False
@@ -180,12 +183,19 @@ class Trainer(Wrapper):
             train_pred.extend(out.tolist())
 
             # ce = F.cross_entropy(out, y.to(self.device), reduction='mean')
-            loss += mmd
-            losses.append(loss.item())
-            loss.backward()
+            tot_loss = mmd + loss
+            # tot_loss = mmd
+            losses.append(tot_loss.item())
+            tot_loss.backward()
+
+            # for n, p in self.model.named_parameters():
+            #     if p.grad is not None:
+            #         print(n, p.shape, p.grad.mean())
+            #
+            # input()
             self.optimizer.step()
 
-            # progress_bar.set_postfix(ce_loss=ce.item(), mmd_loss=mmd.item())
+            progress_bar.set_postfix(ce_loss=loss.item(), mmd_loss=mmd.item())
 
         return losses, (train_true, train_pred)
 
@@ -207,115 +217,9 @@ class Trainer(Wrapper):
         return test_true, test_pred
 
     def train_step(self, train_samples=1, test_samples=1, **kwargs):
-        losses, train_res = self.train_epoch(samples=train_samples)
-        test_res = self.test_evaluation(samples=test_samples)
+        losses, train_res = self.train_epoch(samples=train_samples, **kwargs)
+        test_res = self.test_evaluation(samples=test_samples, **kwargs)
         return losses, train_res, test_res
 
     def snr_test(self, percentiles: list):
         return None
-
-    # def rotation_test(self, samples=1):
-    #     ts_copy = copy(self.test_data.dataset.transform)
-    #
-    #     HS = []
-    #     DIFF = []
-    #     scores = []
-    #     self.model.eval()
-    #
-    #     for angle in self.rotations:
-    #         ts = T.Compose([AngleRotation(angle), ts_copy])
-    #         self.test_data.dataset.transform = ts
-    #
-    #         H = []
-    #         pred_label = []
-    #         true_label = []
-    #
-    #         diff = []
-    #
-    #         outs = []
-    #         self.model.eval()
-    #         with torch.no_grad():
-    #             for i, (x, y) in enumerate(self.test_data):
-    #                 true_label.extend(y.tolist())
-    #
-    #                 out = self.model.eval_forward(x.to(self.device), samples=samples)
-    #
-    #                 outs.append(out.cpu().numpy())
-    #
-    #                 out_m = out.mean(0)
-    #                 pred_label.extend(out_m.argmax(dim=-1).tolist())
-    #
-    #                 top_score, top_label = torch.topk(F.softmax(out.mean(0), -1), 2)
-    #
-    #                 H.extend(top_score[:, 0].tolist())
-    #                 diff.extend(((top_score[:, 0] - top_score[:, 1]) ** 2).tolist())
-    #
-    #         p_hat = np.asarray(H)
-    #
-    #         mean_diff = np.mean(diff)
-    #
-    #         epistemic = np.mean(p_hat ** 2, axis=0) - np.mean(p_hat, axis=0) ** 2
-    #         aleatoric = np.mean(p_hat * (1 - p_hat), axis=0)
-    #
-    #         entropy = aleatoric + epistemic
-    #
-    #         # HS.append((np.mean(correct_h), np.mean(incorrect_h)))
-    #
-    #         # HS.append(np.mean(H))
-    #
-    #         HS.append(entropy)
-    #         DIFF.append(mean_diff)
-    #         scores.append(metrics.f1_score(true_label, pred_label, average='micro'))
-    #
-    #     self.test_data.dataset.transform = ts_copy
-    #     return HS, DIFF, scores
-
-    # def attack_test(self, samples=1):
-    #     HS = []
-    #     scores = []
-    #
-    #     self.model.eval()
-    #     for eps in self.epsilons:
-    #
-    #         H = []
-    #         pred_label = []
-    #         true_label = []
-    #
-    #         # self.model.eval()
-    #         for i, (x, y) in enumerate(self.test_data):
-    #             true_label.extend(y.tolist())
-    #
-    #             x = x.to(self.device)
-    #             y = y.to(self.device)
-    #
-    #             self.model.zero_grad()
-    #             x.requires_grad = True
-    #             out, mmd = self.model(x, samples=samples)
-    #             out = out.mean(0)
-    #
-    #             pred = (out.mean(0).argmax(dim=-1) == y).tolist()
-    #
-    #             ce = F.cross_entropy(out, y, reduction='mean')
-    #             # loss = ce + mmd
-    #             ce.backward()
-    #
-    #             perturbed_data = fgsm_attack(x, eps)
-    #             out = self.model.eval_forward(perturbed_data, samples=samples)
-    #             # out = out.mean(0)
-    #             pred_label.extend(out.mean(0).argmax(dim=-1).tolist())
-    #
-    #             # a = compute_entropy(F.softmax(out, -1), True).tolist()
-    #
-    #             # print(a)
-    #             # print(pred)
-    #             # print([a[i] for i in range(len(a)) if pred[i] == 0 ], np.mean(a))
-    #             # input()
-    #             entropy = compute_entropy(F.softmax(out, -1)).mean(0)
-    #
-    #             # H.extend(compute_entropy(entropy).tolist())
-    #             # H.extend(compute_entropy(F.softmax(out, -1)).tolist())
-    #
-    #         scores.append(metrics.f1_score(true_label, pred_label, average='micro'))
-    #         HS.append(np.mean(H))
-    #
-    #     return HS, scores
