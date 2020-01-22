@@ -71,14 +71,8 @@ from bayesian_utils import BayesianCNNLayer, BayesianLinearLayer
 class BMMD(Network):
 
     def __init__(self, sample, classes, topology=None, prior=None, mu_init=None, rho_init=None,
-                 local_trick=False, regression=False, **kwargs):
+                 local_trick=False, regression=False, posterior_type='weights', **kwargs):
         super().__init__(classes, regression)
-
-        # if mu_init is None:
-        #     mu_init = (-0.6, 0.6)
-
-        # if rho_init is None:
-        #     rho_init = -3
 
         if topology is None:
             topology = [400, 400]
@@ -89,7 +83,8 @@ class BMMD(Network):
         self.calculate_mmd = True
         self._prior = prior
         self.features = get_bayesian_network(topology, sample, classes,
-                                             mu_init, rho_init, prior, 'mmd', local_trick, bias=True, **kwargs)
+                                             mu_init, rho_init, prior, 'mmd', local_trick, posterior_type, bias=True,
+                                             **kwargs)
 
         # ##################### non abbandonarmi più jary!!!!
         # ##################### Scusa :'(
@@ -120,9 +115,6 @@ class BMMD(Network):
         mmds = torch.stack(mmds).mean()
 
         return o, mmds
-
-    def layers(self):
-        return chain(self.features, self.classificator)
 
     def eval_forward(self, x, samples=1):
         o, _ = self(x, samples=samples)
@@ -160,61 +152,41 @@ class Trainer(Wrapper):
             self.optimizer.zero_grad()
 
             out, mmd = self.model(x, samples=samples)
-            out = out.mean(0)
-            mmd *= mmd_w
-            mmd /= x.shape[0]
-            #mmd *= pi[batch]
-            #mmd *= 1/M
+            # out = out.mean(0)
 
-            if mmd == 0:
+            mmd *= mmd_w
+            # mmd /= x.shape[0]
+            mmd *= pi[batch]
+            # mmd *= 1/M
+
+            if pi[batch] == 0:
                 self.model.calculate_mmd = False
 
             if self.regression:
+                out = out.mean(0)
                 if self.model.classes == 1:
                     noise = self.model.noise.exp()
                     x = out
                     loss = self.loss_function(x, y, noise)
                 else:
-                    loss = self.loss_function(out[:, :1], y, out[:, 1:].exp())#/x.shape[0]
+                    loss = self.loss_function(out[:, :1], y, out[:, 1:].exp())  # /x.shape[0]
             else:
                 loss = self.loss_function(out, y)
+                out = torch.softmax(out, -1).mean(0)
                 out = out.argmax(dim=-1)
 
             train_pred.extend(out.tolist())
 
-            # ce = F.cross_entropy(out, y.to(self.device), reduction='mean')
             tot_loss = mmd + loss
-            # tot_loss = mmd
+
             losses.append(tot_loss.item())
             tot_loss.backward()
 
-            # for n, p in self.model.named_parameters():
-            #     if p.grad is not None:
-            #         print(n, p.shape, p.grad.mean())
-            #
-            # input()
             self.optimizer.step()
 
             progress_bar.set_postfix(ce_loss=loss.item(), mmd_loss=mmd.item())
 
         return losses, (train_true, train_pred)
-
-    def test_evaluation(self, samples, **kwargs):
-
-        test_pred = []
-        test_true = []
-
-        self.model.eval()
-        with torch.no_grad():
-            for i, (x, y) in enumerate(self.test_data):
-                test_true.extend(y.tolist())
-
-                out = self.model.eval_forward(x.to(self.device), samples=samples)
-                out = out.mean(0)
-                out = out.argmax(dim=-1)
-                test_pred.extend(out.tolist())
-
-        return test_true, test_pred
 
     def train_step(self, train_samples=1, test_samples=1, **kwargs):
         losses, train_res = self.train_epoch(samples=train_samples, **kwargs)

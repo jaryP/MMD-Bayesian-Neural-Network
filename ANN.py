@@ -26,9 +26,6 @@ class ANN(Network):
 
         return x
 
-    def layers(self):
-        return chain(self.features, self.classificator)
-
     def eval_forward(self, x, **kwargs):
         return self.forward(x)
 

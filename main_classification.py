@@ -1,36 +1,31 @@
 import pickle
-from copy import deepcopy
+import time
 
 import matplotlib.pyplot as plt
 import torch
 import torchvision
-import scipy.stats as stats
 from scipy.stats import gaussian_kde
-from sklearn.decomposition import PCA
 from torchvision import datasets
 from torchvision.transforms import transforms
+import random
 
 import ANN
 import DropoutNet
-from base import ScaledMixtureGaussian, Gaussian, Laplace
-from bayesian_utils import BayesianLinearLayer, BayesianCNNLayer
+from base import ScaledMixtureGaussian, Gaussian, Laplace, Uniform
 
 
-def get_dataset(name, batch_size, dev_split):
+def get_dataset(name, batch_size, dev_split, resize=None):
     if name in ['fMNIST', 'MNIST']:
+
+        tr = [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
+
+        if resize is not None:
+            tr.insert(0, transforms.Resize(resize))
+
         if name == "fMNIST":
-            image_transform = transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize((0.1307,), (0.3081,)),
-                # transforms.Normalize((0,), (1,)),
-                torch.flatten
-            ])
-        else:
-            image_transform = transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize((0.1307,), (0.3081,)),
-                # transforms.Normalize((0,), (1,)),
-            ])
+            tr.append(torch.flatten)
+
+        image_transform = transforms.Compose(tr)
 
         train_split = datasets.MNIST('./Datasets/MNIST', train=True, download=True,
                                      transform=image_transform)
@@ -41,9 +36,13 @@ def get_dataset(name, batch_size, dev_split):
         classes = 10
 
     if name == 'CIFAR10':
-        transform = transforms.Compose(
-            [transforms.ToTensor(),
-             transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261))])
+        tr = [transforms.ToTensor(),
+              transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261))]
+
+        if resize is not None:
+            tr.insert(0, transforms.Resize(resize))
+
+        transform = transforms.Compose(tr)
 
         train_split = torchvision.datasets.CIFAR10(root='./Datasets/CIFAR10', train=True,
                                                    download=True, transform=transform)
@@ -72,10 +71,9 @@ def get_dataset(name, batch_size, dev_split):
 
 
 def plot_test(exps, tests):
-    fig, ax = plt.subplots(nrows=3)
+    fig, ax = plt.subplots(nrows=2)
 
     for d, r in zip(exps, tests):
-
         if r[0] is None:
             continue
 
@@ -87,20 +85,23 @@ def plot_test(exps, tests):
             scores.append(i[2])
 
         h = np.asarray(h).mean(0)
-        diff = np.asarray(diff).mean(0)
+        # diff = np.asarray(diff).mean(0)
         scores = np.asarray(scores).mean(0)
 
         x = range(len(scores))
-        ax[0].plot(x, scores, label=d.get('label', d['network_type']), c=d['color'])
+        ax[0].plot(x, scores, label=d.get('label', d['network_type']), c=d['color'], linewidth=0.5)
+        ax[0].set_xticks(x)
 
-        ax[1].plot(x, h[:, 0],  # linestyle='--',
-                   label='{} uncertainty'.format(d.get('label', d['network_type'])), c=d['color'])
+        ax[1].plot(x, h,  # linestyle='--',
+                   label='{} uncertainty'.format(d.get('label', d['network_type'])), c=d['color'], linewidth=0.5)
+        ax[1].set_xticks(x)
 
         # ax[1].plot(x, h[:, 1], linestyle='-.',
         #            label='{} uncertainty'.format(d.get('label', d['network_type'])), c=d['color'])
 
-        ax[2].plot(x, diff,
-                   label='{} (top1-top2)**2'.format(d.get('label', d['network_type'])), c=d['color'])
+        # ax[2].plot(x, diff,
+        #            label='{} (top1-top2)**2'.format(d.get('label', d['network_type'])), c=d['color'])
+        # ax[2].set_xticks(x)
 
     handles, labels = ax[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc='upper center')
@@ -108,7 +109,7 @@ def plot_test(exps, tests):
     return fig, ax
 
 
-def main(experiments):
+def main(experiment):
     import sklearn.metrics as metrics
     import tqdm as tqdm
 
@@ -116,53 +117,39 @@ def main(experiments):
     import BMMD
 
     import os
-    from enum import Enum
     import numpy as np
 
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    class Optimizers(Enum):
-        sgd = 'sgd'
-        adam = 'adam'
-
-        def __str__(self):
-            return self.value
-
-    class NetworkTypes(Enum):
-        bbb = 'bbb'
-        mmd = 'mmd'
-        normal = 'normal'
-        dropout = 'dropout'
-
-        def __str__(self):
-            return self.value
-
-    class Datasets(Enum):
-        fMNIST = 'fMNIST'
-        MNIST = 'MNIST'
-        CIFAR10 = 'CIFAR10'
-
-        def __str__(self):
-            return self.value
-
-    class Priors(Enum):
-        gaussian = 'gaussian'
-        scaledGaussian = 'scaledGaussian'
-        laplace = 'laplace'
-        # multivaraite = 'Mu'
-
-        def __str__(self):
-            return self.value
+    Optimizers = ['sgd', 'adam', 'rmsprop']
+    NetworkTypes = ['bbb', 'mmd', 'normal', 'dropout']
+    Datasets = ['fMNIST', 'MNIST', 'CIFAR10']
+    PosteriorType = ['layers', 'neurons', 'weights', 'multiplicative']
+    LrScheduler = ['step', 'exponential', 'plateau']
+    Priors = ['gaussian', 'laplace', 'uniform', 'scaledGaussian']
 
     experiments_results = []
     adversarial_attack_results = []
     rotation_results = []
+    reliability = []
+
     hists = []
     all_ws = []
 
+    experiments_path = experiment['experiments_path']
+
+    experiments = experiment['experiments']
+
+    cm = plt.get_cmap('tab20')
+    cm = iter(cm.colors)
+
+    # print(cm.colors)
     for data in experiments:
-        print(data)
+        print(data['save_path'], data['exp_name'])
+
+        if data.get('skip', False):
+            continue
 
         # PRIORS
 
@@ -171,42 +158,19 @@ def main(experiments):
 
         if data_prior:
             t = data_prior.get('type')
-            if t not in list(map(str, Priors)):
+            if t not in Priors:
                 raise ValueError('Supported priors', list(Priors))
             else:
                 if t == 'gaussian':
                     prior = Gaussian(data_prior['mu'], data_prior['sigma'])
-                if t == 'laplace':
+                elif t == 'laplace':
                     prior = Laplace(data_prior['mu'], data_prior['scale'])
-                if t == 'scaledGaussian':
+                elif t == 'scaledGaussian':
                     prior = ScaledMixtureGaussian(pi=data_prior['phi'], mu1=data_prior['mu1'], s1=data_prior['sigma1'],
                                                   mu2=data_prior['mu2'], s2=data_prior['sigma2'])
+                elif t == 'uniform':
+                    prior = Uniform(a=data_prior['a'], b=data_prior['b'])
 
-        # if data.get('prior_mu_sigma') is not None:
-        #
-        #     mu, sigma = data.get('prior_mu_sigma')
-        #     if data.get('scaled_gaussian', False):
-        #         pi = data['scaled_pi']
-        #         mu1, sigma1 = data['prior1_mu_sigma']
-        #         prior = ScaledMixtureGaussian(pi=pi, mu1=mu, s1=sigma, mu2=mu1, s2=sigma1)
-        #         # print(prior.s1, prior.s2)
-        #         # a = prior.sample(torch.tensor([1000])).numpy()
-        #         # plt.hist(a, bins=100)
-        #         #
-        #         # # prior = Gaussian(mu, sigma)
-        #         # # a = prior.sample(torch.tensor([1000])).numpy()
-        #         # # plt.hist(a, bins=100)
-        #         # #
-        #         # # prior = Gaussian(mu1, sigma1)
-        #         # # a = prior.sample(torch.tensor([1000])).numpy()
-        #         # # plt.hist(a, bins=100)
-        #         #fprin
-        #         # plt.show()
-        #
-        #     else:
-        #         prior = Gaussian(mu, sigma)
-
-        # Parameters of the experiments
         batch_size = data.get('batch_size', 64)
         lr = data.get('lr', 1e-3)
         topology = data['topology']
@@ -230,23 +194,24 @@ def main(experiments):
         local_trick = data.get('local_trick', False)
         # label = data.get("label", network)
         network_parameters = data.get('network_parameters', {})
+        posterior_type = data.get('posterior_type', 'weights')
+        moment = data.get('moment', 0)
+        early_stopping_tolerance = data.get('early_stopping_tolerance', 5)
+        resize = data.get('resize', None)
+        weight_decay = data.get('weight_decay', 0)
+        lr_scheduler = data.get('lr_scheduler', None)
 
         if epochs < 0:
             raise ValueError('The number of epoch should be > 0')
 
-        # if isinstance(experiments, int):
-        #     experiments = [experiments]
-
         if isinstance(seeds, int):
             seeds = [seeds]
 
-        # if isinstance(experiments, list):
-        #     if (not isinstance(seeds, list)) or (isinstance(seeds, list) and len(experiments) != len(seeds)):
-        #         raise ValueError('The number of the experiments and the number of seeds needs to match, '
-        #                          'given: {} and {}'.format(experiments, seeds))
+        if posterior_type not in PosteriorType:
+            raise ValueError('Supported posterior_type', PosteriorType)
 
-        if network not in list(map(str, NetworkTypes)):
-            raise ValueError('Supported networks', list(NetworkTypes))
+        if network not in NetworkTypes:
+            raise ValueError('Supported networks', NetworkTypes)
         else:
             if network == 'mmd':
                 base_model = BMMD.BMMD
@@ -277,16 +242,19 @@ def main(experiments):
                     data['color'] = 'k'
 
         if data["color"] == "":
-            data["color"] = None
+            data["color"] = next(cm)
 
-        if optimizer not in list(map(str, Optimizers)):
-            raise ValueError('Supported optimizers', list(Optimizers))
+        if optimizer not in Optimizers:
+            raise ValueError('Supported optimizers', Optimizers)
         else:
             if optimizer == 'sgd':
-                optimizer = torch.optim.SGD
+                opt = torch.optim.SGD
 
             elif optimizer == 'adam':
-                optimizer = torch.optim.Adam
+                opt = torch.optim.Adam
+
+            elif optimizer == 'rmsprop':
+                opt = torch.optim.RMSprop
 
         run_results = []
         local_rotate_res = []
@@ -296,19 +264,48 @@ def main(experiments):
 
             torch.manual_seed(seed)
             np.random.seed(seed)
+            random.seed(seed)
 
-            if dataset not in list(map(str, Datasets)):
-                raise ValueError('Supported datasets {}, given {}'.format(list(Datasets), dataset))
+            best_score = 0
+
+            if dataset not in Datasets:
+                raise ValueError('Supported datasets {}, given {}'.format(Datasets, dataset))
             else:
-                sample, classes, train_loader, test_loader = get_dataset(dataset, batch_size, dev_split)
+                sample, classes, train_loader, test_loader = get_dataset(dataset, batch_size, dev_split, resize)
 
             model = base_model(prior=prior, mu_init=weights_mu_init, device=device,
                                rho_init=weights_rho_init, topology=topology, classes=classes, local_trick=local_trick,
-                               sample=sample, **network_parameters)
-            init_model = deepcopy(model)
+                               sample=sample, **network_parameters, posterior_type=posterior_type)
+            # print(model)
+            # init_model = deepcopy(model)
 
             model.to(device)
-            opt = optimizer(model.parameters(), lr=lr)
+
+            if optimizer != 'adam':
+                opt = opt(model.parameters(), lr=lr, momentum=moment, weight_decay=weight_decay)
+            else:
+                opt = opt(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+            scheduler = None
+
+            if lr_scheduler is not None:
+                t = lr_scheduler.get('type', 'step')
+
+                if t not in LrScheduler:
+                    raise ValueError('Supported optimizers', LrScheduler)
+
+                if t == 'step':
+                    step, decay = lr_scheduler.get('step', 10), lr_scheduler.get('decay', 0.1)
+                    scheduler = torch.optim.lr_scheduler.StepLR(opt, step, gamma=decay)
+
+                elif t == 'exponential':
+                    decay = lr_scheduler.get('decay', 0.1)
+                    scheduler = torch.optim.lr_scheduler.ExponentialLR(opt, gamma=decay)
+
+                elif t == 'plateau':
+                    tolerance, decay = lr_scheduler.get('tolerance', 2), lr_scheduler.get('decay', 0.1)
+                    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=decay, verbose=True,
+                                                                              patience=tolerance, mode='max')
 
             current_path = os.path.join(save_path, exp_name)  # , str(e))
 
@@ -316,35 +313,71 @@ def main(experiments):
             epoch_start = 0
 
             results_path = os.path.join(current_path, 'results_{}.data'.format(e))
+            best_path = os.path.join(current_path, 'best_model_{}.data'.format(e))
 
             if save and not os.path.exists(current_path):
                 os.makedirs(current_path)
 
             loaded = False
+            early_stopping = (0, 0)
 
             if load and os.path.exists(results_path):
                 loaded = True
-                checkpoint = torch.load(results_path)
-                model.load_state_dict(checkpoint['model_state_dict'])
-                opt.load_state_dict(checkpoint['optimizer_state_dict'])
-                epoch_start = checkpoint['epoch'] + 1
-                results = checkpoint
+                results = torch.load(results_path)
+                model.load_state_dict(results['model_state_dict'])
+                opt.load_state_dict(results['optimizer_state_dict'])
+                epoch_start = results['epoch'] + 1
+                early_stopping = results['early_stopping']  # (best_score, early_stopping_tolerance)
+
+                if scheduler is not None:
+                    scheduler.load_state_dict(results['optimizer_state_dict'])
+
                 print(results.get('test_results')[1:])
                 print(results.get('train_results'))
 
-            f1 = results.get('test_results', ['not calculated'])[-1]
-            f1_train = results.get('train_results', ['not calculated'])[-1]
-            progress_bar = tqdm.tqdm(range(epoch_start, epochs), initial=epoch_start, total=epochs)
-            progress_bar.set_postfix(f1_test=f1, f1_train=f1_train)
+                best_score = np.max(results.get('test_results'))
 
             t = trainer(model, train_loader, test_loader, opt)
 
-            for i in progress_bar:
+            if early_stopping[1] < early_stopping_tolerance:
+                f1 = results.get('test_results', ['not calculated'])[-1]
+                f1_train = results.get('train_results', ['not calculated'])[-1]
 
-                if i == 0:
-                    (test_true, test_pred) = t.test_evaluation(samples=test_samples)
+                progress_bar = tqdm.tqdm(range(epoch_start, epochs), initial=epoch_start, total=epochs)
+                progress_bar.set_postfix(f1_test=f1, f1_train=f1_train)
+
+                for i in progress_bar:
+
+                    if i == 0:
+                        (test_true, test_pred) = t.test_evaluation(samples=test_samples)
+
+                        f1 = metrics.f1_score(test_true, test_pred, average='micro')
+
+                        epochs_res = results.get('test_results', [])
+                        epochs_res.append(f1)
+
+                        epochs_res_train = results.get('train_results', [])
+                        epochs_res_train.append(f1_train)
+
+                        results.update({'epoch': i, 'test_results': epochs_res})
+
+                    start_time = time.time()
+                    loss, (train_true, train_pred), (test_true, test_pred) = t.train_step(train_samples=train_samples,
+                                                                                          test_samples=test_samples,
+                                                                                          weights=loss_weights)
+                    end_time = time.time()
+                    elapsed_time = end_time - start_time
+
+                    loss = np.mean(loss)
 
                     f1 = metrics.f1_score(test_true, test_pred, average='micro')
+
+                    if scheduler is not None:
+                        scheduler.step(f1)
+
+                    f1_train = metrics.f1_score(train_true, train_pred, average='micro')
+
+                    progress_bar.set_postfix(f1_test=f1, f1_train=f1_train)
 
                     epochs_res = results.get('test_results', [])
                     epochs_res.append(f1)
@@ -352,40 +385,43 @@ def main(experiments):
                     epochs_res_train = results.get('train_results', [])
                     epochs_res_train.append(f1_train)
 
-                    results.update({'epoch': i, 'test_results': epochs_res})
+                    losses = results.get('losses', [])
+                    losses.append(loss)
 
-                loss, (train_true, train_pred), (test_true, test_pred) = t.train_step(train_samples=train_samples,
-                                                                                      test_samples=test_samples,
-                                                                                      weights=loss_weights)
+                    training_time = results.get('training_time', 0) + elapsed_time
 
-                loss = np.mean(loss)
+                    if f1 > best_score:
+                        best_score = f1
+                        early_stopping = (best_score, 0)
+                        if save:
+                            torch.save(t.model.state_dict(), best_path)
+                    else:
+                        print(early_stopping)
+                        early_stopping = (best_score, early_stopping[1] + 1)
 
-                f1 = metrics.f1_score(test_true, test_pred, average='micro')
+                    results.update({
+                        'epoch': i, 'test_results': epochs_res, 'train_results': epochs_res_train,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': opt.state_dict(),
+                        'losses': losses,
+                        'early_stopping': early_stopping,
+                        'training_time': training_time,
+                        'scheduler': scheduler.state_dict()
+                    })
 
-                f1_train = metrics.f1_score(train_true, train_pred, average='micro')
+                    if save:
+                        torch.save(results, results_path)
 
-                progress_bar.set_postfix(f1_test=f1, f1_train=f1_train)
+                    if early_stopping[1] == early_stopping_tolerance:
+                        break
 
-                epochs_res = results.get('test_results', [])
-                epochs_res.append(f1)
+                progress_bar.close()
+            else:
+                run_results.append(results)
 
-                epochs_res_train = results.get('train_results', [])
-                epochs_res_train.append(f1_train)
-
-                losses = results.get('losses', [])
-                losses.append(loss)
-
-                results.update({
-                    'epoch': i, 'test_results': epochs_res, 'train_results': epochs_res_train,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': opt.state_dict(),
-                    'losses': losses
-                })
-                if save:
-                    torch.save(results, results_path)
+            t.model.load_state_dict(torch.load(best_path))
 
             run_results.append(results)
-            progress_bar.close()
 
             # plt.figure(0)
 
@@ -394,242 +430,253 @@ def main(experiments):
 
             if network != 'normal':
 
+                #     if network != 'dropout':
+                #         for p in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
+                #             t.model.set_mask(p)
+                #             (test_true, test_pred) = t.test_evaluation(samples=test_samples)
+                #             print(p, metrics.f1_score(test_true, test_pred, average='micro'))
+                #
+                #     t.model.set_mask(None)
+
                 attack1_path = os.path.join(current_path, 'attack1_{}.data'.format(e))
                 attack2_path = os.path.join(current_path, 'attack2_{}.data'.format(e))
 
                 if loaded:
-                    if os.path.exists(attack1_path):
-                        with open(attack1_path, "rb") as f:
-                            h1 = pickle.load(f)
+                    # if os.path.exists(attack1_path):
+                    #     with open(attack1_path, "rb") as f:
+                    #         h1 = pickle.load(f)
 
                     if os.path.exists(attack2_path):
                         with open(attack2_path, "rb") as f:
                             h2 = pickle.load(f)
 
-                if h1 is None:
-                    h1 = t.rotation_test(samples=test_samples)
-                    if save:
-                        with open(attack1_path, "wb") as output_file:
-                            pickle.dump(h1, output_file)
-
-                # if h2 is None:
-                #     h2 = t.attack_test(samples=test_samples)
+                # if h1 is None:
+                #     h1 = t.shuffle_test(samples=test_samples)
                 #     if save:
-                #         with open(attack2_path, "wb") as output_file:
-                #             pickle.dump(h2, output_file)
+                #         with open(attack1_path, "wb") as output_file:
+                #             pickle.dump(h1, output_file)
+
+                if h2 is None:
+                    h2 = t.attack_test(samples=test_samples)
+                    if save:
+                        with open(attack2_path, "wb") as output_file:
+                            pickle.dump(h2, output_file)
 
             local_rotate_res.append(h1)
             local_attack_res.append(h2)
 
-            # else:
-            #     local_rotate_res.append(None)
-            #     local_attack_res.append(None)
-
             ws = []
-            ws_init = []
+            # ws_init = []
             to_hist = []
 
-            if network in ['bbb', 'mmd']:
-                # last = None
-                for layer in t.model.features:
-                    if isinstance(layer, (BayesianLinearLayer, BayesianCNNLayer)):
-                        last = layer
-                        w = layer.w
-                        b = layer.b
+            # if network in ['bbb', 'mmd']:
+            #     # last = None
+            #     continue
+            #     for layer in t.model.features:
+            #         wc = []
+            #         if isinstance(layer, (BayesianLinearLayer, BayesianCNNLayer)):
+            #             w = layer.w
+            #             b = layer.b
+            #
+            #             mean = np.abs(w.mu.detach().cpu().numpy())
+            #             std = w.sigma.detach().cpu().numpy()
+            #             snr = mean / std
+            #             to_hist.append(np.reshape(snr, -1))
+            #             # ws.append(np.reshape(w.weights.detach().cpu().numpy(), -1))
+            #             wc.extend(np.reshape(w.weights.detach().cpu().numpy(), -1))
+            #             if b is not None:
+            #                 mean = np.abs(b.mu.detach().cpu().numpy())
+            #                 std = b.sigma.detach().cpu().numpy()
+            #                 snr = mean / std
+            #                 to_hist.append(np.reshape(snr, -1))
+            #                 # to_hist.append(np.reshape(w.weights.detach().cpu().numpy(), -1))
+            #
+            #                 # ws.append(np.reshape(b.weights.detach().cpu().numpy(), -1))
+            #                 wc.extend(np.reshape(b.weights.detach().cpu().numpy(), -1))
+            #
+            #             ws.append(wc)
+            #
+            #     # for layer in init_model.features:
+            #     #     wc = []
+            #     #     if isinstance(layer, (BayesianLinearLayer, BayesianCNNLayer)):
+            #     #         w = layer.w
+            #     #         b = layer.b
+            #     #
+            #     #         # ws_init.append(np.reshape(w.weights.detach().cpu().numpy(), -1))
+            #     #         wc.extend(np.reshape(w.weights.detach().cpu().numpy(), -1))
+            #     #
+            #     #         if b is not None:
+            #     #             # ws_init.append(np.reshape(b.weights.detach().cpu().numpy(), -1))
+            #     #             wc.extend(np.reshape(b.weights.detach().cpu().numpy(), -1))
+            #     #
+            #     #         ws.append(np.asarray(wc))
+            #     # ws = np.concatenate(ws)
+            #     # ws_init = np.concatenate(ws_init)
+            #
+            #     to_hist = np.concatenate(to_hist)
+            #     hists.append(to_hist)
+            #     all_ws.append(ws)
+            #
+            #     # else:
+            #     #     hists.append([])
+            #     #     for m in t.model.parameters():
+            #     #         ws.append(np.reshape(m.data.detach().cpu().numpy(), -1))
+            #     #
+            #     #     # for m in init_model.parameters():
+            #     #     #     ws_init.append(np.reshape(m.data.detach().cpu().numpy(), -1))
+            #     #
+            #     #     # ws = np.concatenate(ws)
+            #     #     ws_init = np.concatenate(ws_init)
+            #
+            #     fig, ax = plt.subplots()
+            #
+            #     for l, w in enumerate(ws):
+            #         xs = np.linspace(np.min(w) - 0.1, np.max(w) + 0.1, 200)
+            #         density = gaussian_kde(w)
+            #         density._compute_covariance()
+            #         plt.plot(xs, density(xs), label="Final weights layer {}".format(l + 1), linewidth=0.5)
+            #
+            #     # xs = np.linspace(ws_init.min(), ws_init.max(), 200)
+            #     # density = gaussian_kde(ws_init)
+            #     # density._compute_covariance()
+            #     # plt.plot(xs, density(xs), label="Initial weights", linewidth=0.5)
+            #
+            #     # if network in ['bbb', 'mmd']:
+            #     #     s = prior.sample(torch.Size([5000])).numpy()
+            #     #     xs = np.linspace(s.min(), s.max(), 200)
+            #     #     density = gaussian_kde(s)
+            #     #     # # density._compute_covariance()
+            #     #     plt.plot(xs, density(xs), label="Prior", linewidth=0.5)
+            #     #     # hist, _, _ = ax.hist(prior.sample(torch.Size([1000])).numpy(), bins=1000, linewidth=0.5, density=False,
+            #     #     #                      label="Prior", histtype='step')
+            #
+            #     plt.legend()
+            #     fig.savefig(os.path.join(current_path, "{}_{}_posterior.pdf".format(e, network)),
+            #                 bbox_inches='tight')
+            #     plt.close(fig)
 
-                        # snr = w.weights.detach().cpu().numpy()
-                        mean = np.abs(w.mu.detach().cpu().numpy())
-                        std = w.sigma.detach().cpu().numpy()
-                        # mean = np.abs(snr.mean())
-                        # std = np.std(snr)
-                        snr = mean / std
-                        to_hist.append(np.reshape(snr, -1))
-                        ws.append(np.reshape(w.weights.detach().cpu().numpy(), -1))
+            r = t.reliability_diagram(samples=test_samples)
+            reliability.append(r)
 
-                        if b is not None:
-                            mean = np.abs(b.mu.detach().cpu().numpy())
-                            std = b.sigma.detach().cpu().numpy()
-                            snr = mean / std
-                            to_hist.append(np.reshape(snr, -1))
-                            ws.append(np.reshape(b.weights.detach().cpu().numpy(), -1))
-
-                for layer in init_model.features:
-                    if isinstance(layer, (BayesianLinearLayer, BayesianCNNLayer)):
-                        # last = layer
-                        w = layer.w
-                        b = layer.b
-
-                        # snr = w.weights.detach().cpu().numpy()
-                        # mean = np.abs(w.mu.detach().cpu().numpy())
-                        # std = w.sigma.detach().cpu().numpy()
-                        # mean = np.abs(snr.mean())
-                        # std = np.std(snr)
-                        # snr = mean / std
-                        # to_hist.append(np.reshape(snr, -1))
-                        ws_init.append(np.reshape(w.weights.detach().cpu().numpy(), -1))
-
-                        if b is not None:
-                            # mean = np.abs(b.mu.detach().cpu().numpy())
-                            # std = b.sigma.detach().cpu().numpy()
-                            # snr = mean / std
-                            # to_hist.append(np.reshape(snr, -1))
-                            ws_init.append(np.reshape(b.weights.detach().cpu().numpy(), -1))
-
-                ws = np.concatenate(ws)
-                ws_init = np.concatenate(ws_init)
-
-                to_hist = np.concatenate(to_hist)
-                hists.append(to_hist)
-                all_ws.append(ws)
-
-                # print(last.w.weights.shape)
-                # c0 = []
-                # c1 = []
-                # plt.figure()
-                #
-                # # for i in range(100):
-                # w = last.w.weights.detach().cpu().numpy()
-                # # print(last.w.sigma.detach().cpu().numpy()[:, 0])
-                #
-                # # print(last.w.mu.detach().cpu().numpy()[:, 0])
-                #
-                # plt.hist2d(w[:, 0], w[:, 1], bins=10000)
-                # plt.show()
-
-                # import matplotlib.pyplot as plt
-                # fig, ax = plt.subplots(nrows=2, ncols=1)
-                # hist, _, _ = ax[0].hist(to_hist, bins=100)
-                # cs = np.cumsum(hist)
-                # ax[1].plot(range(len(cs)), cs)
-                # # plt.show()
-                #
-                # plt.savefig(os.path.join(current_path, "{}_{}_weights_distribution.pdf".format(e, network)),
-                #             bbox_inches='tight')
-                # plt.close()
-
-                # plt.figure()
-                #
-                # last_mu = last.w.mu.detach().cpu().numpy().mean(-1)
-                # last_sigma = last.w.sigma.detach().cpu().numpy().mean(-1)
-                #
-                # for mu, sigma in zip(last_mu, last_sigma):
-                #     # print(mu, sigma)
-                #     x = np.linspace(mu - 3 * sigma, mu + 3 * sigma, 100)
-                #     plt.plot(x, stats.norm.pdf(x, mu, sigma))
-                #
-                # plt.show()
-                # plt.close()
-            else:
-                hists.append([])
-                for m in t.model.parameters():
-                    ws.append(np.reshape(m.data.detach().cpu().numpy(), -1))
-
-                for m in init_model.parameters():
-                    ws_init.append(np.reshape(m.data.detach().cpu().numpy(), -1))
-
-                ws = np.concatenate(ws)
-                ws_init = np.concatenate(ws_init)
-
-            fig, ax = plt.subplots()
-            hist, _, _ = ax.hist(ws, bins=1000, linewidth=0.5, density=False,
-                                 label="Final weights",
-                                 color=data['color'], histtype='step')
-
-            hist, _, _ = ax.hist(ws_init, bins=1000, linewidth=0.5, density=False,
-                                 label='Initial weights', histtype='step')
-
-            if network in ['bbb', 'mmd']:
-                hist, _, _ = ax.hist(prior.sample(torch.Size([len(ws)])).numpy(), bins=1000, linewidth=0.5, density=False,
-                                     label="Prior", histtype='step')
-
-            plt.legend()
-            fig.savefig(os.path.join(current_path, "{}_{}_posterior.pdf".format(e, network)),
-                        bbox_inches='tight')
-            plt.close(fig)
-
-        # print(np.asarray(local_rotate_res))
-        # print(np.asarray(local_rotate_res).mean(0))
-
-        # print(np.asarray(local_rotate_res).shape)
         rotation_results.append(local_rotate_res)
         adversarial_attack_results.append(local_attack_res)
-        # print(rotation_results[-1].shape)
-        # adversarial_attack_results.append(np.asarray(local_attack_res).mean(0))
 
-        print('-' * 200)
+        # print('-' * 200)
         experiments_results.append(run_results)
 
-        # f1 = results['test_results']
-        # plt.plot(range(len(f1)), f1, label=label)
-        # plt.legend()
-        # print(f1)
+    # input(reliability)
+    experiments = [e for e in experiments if not e.get('skip', False)]
 
-    # plt.show()
-
-    fig, ax = plot_test(experiments, rotation_results)
-    for a in ax:
-        a.set_xticklabels(['']+ANN.Trainer.rotations)
-    # fig.draw()
-    fig.savefig(os.path.join(save_path, "rotation.pdf"), bbox_inches='tight')
-    plt.close(fig)
+    # fig, ax = plot_test(experiments, rotation_results)
+    #
+    # # for a in ax:
+    # #     a.set_xticklabels(ANN.Trainer.shuffle_percentage, fontsize=8)
+    #
+    # fig.savefig(os.path.join(experiments_path, "shuffle.pdf"), bbox_inches='tight')
+    # plt.close(fig)
 
     fig, ax = plot_test(experiments, adversarial_attack_results)
     for a in ax:
-        a.set_xticklabels(['']+ANN.Trainer.epsilons)
-    fig.savefig(os.path.join(save_path, "fgsa.pdf"), bbox_inches='tight')
+        a.set_xticklabels(ANN.Trainer.epsilons, fontsize=8)
+
+    fig.savefig(os.path.join(experiments_path, "fgsa.pdf"), bbox_inches='tight')
     plt.close(fig)
 
     plt.figure(0)
-    for d, r in zip(experiments, experiments_results):
+
+    print()
+
+    for i in range(len(experiments)):
+        d = experiments[i]
+        r = experiments_results[i]
+        ece = reliability[i][-1]
+
         res = [i['test_results'][1:] for i in r]
-        res = 100 - np.asarray(res) * 100
-        # print(res.shape, res.mean(0), res.std(0))
-        means = res.mean(0)
+        print('Exp: {}, max score:  {} (at epoch {}). '
+              'Training time: {} (s). Ece: {}'.format(d.get('exp_name'),
+                                                      np.max(res), np.argmax(res),
+                                                      r[0].get('training_time', -1), ece))
+
+        # print('Exp: {}, max score:  {}'.format(d.get('exp_name'), np.max(res)))
+
+        res = np.asarray(res)
+
+        means = 100 - res.mean(0) * 100
         stds = res.std(0)
 
         f1 = means
+        save_path = d['save_path']
 
-        plt.plot(range(len(f1)), f1, label=d.get('label', d['network_type']), c=d['color'])
+        plt.plot(range(len(f1)), f1, label=d.get('label', d['network_type']), c=d['color'], linewidth=0.1)
 
         plt.fill_between(range(len(f1)), f1 - stds, f1 + stds, alpha=0.1, color=d['color'])
 
         plt.legend()
 
+    # for d, r in zip(experiments, experiments_results):
+    #     res = [i['test_results'][1:] for i in r]
+    #     print('Exp: {}, max score:  {} (at epoch {})'.format(d.get('exp_name'), np.max(res), np.argmax(res)))
+    #     # print('Exp: {}, max score:  {}'.format(d.get('exp_name'), np.max(res)))
+    #
+    #     res = np.asarray(res)
+    #
+    #     means = 100 - res.mean(0) * 100
+    #     stds = res.std(0)
+    #
+    #     f1 = means
+    #     save_path = d['save_path']
+    #
+    #     plt.plot(range(len(f1)), f1, label=d.get('label', d['network_type']), c=d['color'], linewidth=0.1)
+    #
+    #     plt.fill_between(range(len(f1)), f1 - stds, f1 + stds, alpha=0.1, color=d['color'])
+    #
+    #     plt.legend()
+
     plt.xticks(range(len(f1)), [i + 1 for i in range(len(f1))])
-    # print(f1)
-    # plt.ylim(0.95, 1)
 
     plt.ylabel("Error test (%)")
     plt.xlabel("Epochs")
-    plt.savefig(os.path.join(save_path, "score.pdf"), bbox_inches='tight')
+    plt.savefig(os.path.join(experiments_path, "score.pdf"), bbox_inches='tight')
     plt.close(0)
 
     fig, ax = plt.subplots(nrows=1, ncols=1)
 
-    # ws_max = np.asarray(ws).max()
-    for d, r in zip(experiments, hists):
-        if len(r) == 0:
-            continue
+    # for d, r in zip(experiments, hists):
+    #     if len(r) == 0:
+    #         continue
+    #
+    #     r = 10 * np.log10(r + 1e-12)
+    #     xs = np.linspace(r.min() - 10, r.max() + 10, 200)
+    #     density = gaussian_kde(r)
+    #     density.covariance_factor = lambda: .25
+    #     density._compute_covariance()
+    #     plt.plot(xs, density(xs), label=d.get('label', d['network_type']), color=d['color'])
+    #
+    # ax.legend(loc='upper left')
+    # fig.savefig(os.path.join(experiments_path, "hists.pdf"), bbox_inches='tight')
+    # plt.close(fig)
 
-        # hist, _, _ = ax.hist(10 * np.log10(r + 1e-12), bins=1000, linewidth=0.5,
-        #                      label=d.get('label', d['network_type']), color=d['color'], histtype='step')
-        r = 10 * np.log10(r + 1e-12)
-        xs = np.linspace(-60, 60, 200)
-        density = gaussian_kde(r)
-        density.covariance_factor = lambda: .25
-        density._compute_covariance()
-        plt.plot(xs, density(xs), label=d.get('label', d['network_type']), color=d['color'])
-        # cs = np.cumsum(hist)
-        # ax[1].plot(range(len(cs)), cs, color=d['color'], linewidth=0.5)
-        # if '3' in d['label']:
-        # hist, _, _ = ax[1].hist(ws, bins=2000, linewidth=0.5, density=True,
-        #                         label=d.get('label', d['network_type']), color=d['color'], histtype='step')
+    # # prob_true, prob_pred = get_diagram_data(y_true, y_prob, 5)
+    # #
+    # import matplotlib.pyplot as plt
 
-    ax.legend(loc='upper left')
-    # ax[1].legend(loc='upper left')
-    # cs = np.cumsum(hist)
-    # ax[1].plot(range(len(cs)), cs)
-    fig.savefig(os.path.join(save_path, "hists.pdf"), bbox_inches='tight')
+    fig = plt.figure(1, figsize=(10, 10))
+
+    ax1 = plt.subplot2grid((3, 1), (0, 0), rowspan=2)
+    # ax2 = plt.subplot2grid((3, 1), (2, 0))
+
+    ax1.plot([0, 1], [0, 1], "k:", label="Perfectly calibrated")
+
+    for d, (prob_pred, prob_true, ece) in zip(experiments, reliability):
+        ax1.plot(prob_pred, prob_true, "s-", label=d.get('label', d['network_type']), c=d['color'])
+        # ax2.hist(prob_true, range=(0, 1), bins=50,
+        #          histtype="step", lw=2)
+
+        # print('Exp: {}, ece: {}'.format(d.get('exp_name'), ece))
+
+    ax1.legend(loc='upper left')
+
+    fig.savefig(os.path.join(experiments_path, "calibration_curve.pdf"), bbox_inches='tight')
     plt.close(fig)
 
     return experiments_results
@@ -645,28 +692,4 @@ if __name__ == '__main__':
     with open(args[0], "r") as read_file:
         experiments = json.load(read_file)
 
-    # print(len(experiments))
     results = main(experiments)
-
-    # fig = plt.figure()
-    # for d, r in zip(experiments, results):
-    #     res = [i['test_results'][1:] for i in r]
-    #     res = np.asarray(res)
-    #
-    #     # print(res.shape, res.mean(0), res.std(0))
-    #     means = res.mean(0)
-    #     stds = res.std(0)
-    #
-    #     f1 = means
-    #
-    #     plt.plot(range(len(f1)), f1, label=d.get('label'))
-    #
-    #     plt.fill_between(range(len(f1)), f1 - stds, f1 + stds, alpha=0.3)
-    #
-    #     plt.legend()
-    #     # print(f1)
-    # # plt.ylim(0.95, 1)
-    #
-    # plt.ylabel("Error test (%)")
-    # plt.xlabel("Epochs")
-    # plt.show()

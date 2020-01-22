@@ -39,9 +39,6 @@ class Dropnet(Network):
 
         return o
 
-    def layers(self):
-        return chain(self.features, self.classificator)
-
     def eval_forward(self, x, samples=1):
         o = self(x, samples=samples)
         return o
@@ -72,9 +69,10 @@ class Trainer(Wrapper):
             self.optimizer.zero_grad()
 
             out = self.model(x, samples=samples)
-            out = out.mean(0)
+            # out = out.mean(0)
 
             if self.regression:
+                out = out.mean(0)
                 if self.model.classes == 1:
                     noise = self.model.noise.exp()
                     x = out
@@ -83,6 +81,7 @@ class Trainer(Wrapper):
                     loss = self.loss_function(out[:, :1], y, out[:, 1:].exp())/x.shape[0]
             else:
                 loss = self.loss_function(out, y)
+                out = torch.softmax(out, -1).mean(0)
                 out = out.argmax(dim=-1)
 
             train_pred.extend(out.tolist())
@@ -103,22 +102,22 @@ class Trainer(Wrapper):
 
         return losses, (train_true, train_pred)
 
-    def test_evaluation(self, samples, **kwargs):
-
-        test_pred = []
-        test_true = []
-
-        self.model.eval()
-        with torch.no_grad():
-            for i, (x, y) in enumerate(self.test_data):
-                test_true.extend(y.tolist())
-
-                out = self.model.eval_forward(x.to(self.device), samples=samples)
-                out = out.mean(0)
-                out = out.argmax(dim=-1)
-                test_pred.extend(out.tolist())
-
-        return test_true, test_pred
+    # def test_evaluation(self, samples, **kwargs):
+    #
+    #     test_pred = []
+    #     test_true = []
+    #
+    #     self.model.eval()
+    #     with torch.no_grad():
+    #         for i, (x, y) in enumerate(self.test_data):
+    #             test_true.extend(y.tolist())
+    #
+    #             out = self.model.eval_forward(x.to(self.device), samples=samples)
+    #             out = torch.softmax(out, -1).mean(0)
+    #             out = out.argmax(dim=-1)
+    #             test_pred.extend(out.tolist())
+    #
+    #     return test_true, test_pred
 
     def train_step(self, train_samples=1, test_samples=1, **kwargs):
         losses, train_res = self.train_epoch(samples=train_samples)
