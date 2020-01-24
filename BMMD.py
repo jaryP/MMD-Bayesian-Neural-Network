@@ -133,6 +133,7 @@ class Trainer(Wrapper):
         progress_bar.set_postfix(mmd_loss='not calculated', ce_loss='not calculated')
 
         mmd_w = kwargs.get('weights', {}).get('mmd', 1)
+
         train_true = []
         train_pred = []
 
