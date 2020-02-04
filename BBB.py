@@ -5,8 +5,9 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from base import Gaussian, Network, Wrapper, get_bayesian_network, cross_entropy_loss, log_gaussian_loss
-from bayesian_utils import BayesianCNNLayer, BayesianLinearLayer
+from base import Network, Wrapper, get_bayesian_network, cross_entropy_loss, log_gaussian_loss
+from priors import Gaussian
+from bayesian_layers import BayesianCNNLayer, BayesianLinearLayer
 
 
 class BBB(Network):
@@ -102,7 +103,6 @@ class Trainer(Wrapper):
             self.optimizer.zero_grad()
 
             out, prior, post = self.model(x, samples=samples)
-            out = out.sum(0)
 
             logloss = (post - prior) * pi[batch] #/ x.shape[0]
 
@@ -110,14 +110,19 @@ class Trainer(Wrapper):
                 self.model.calculate_kl = False
 
             if self.regression:
+                out = out.mean(0)
+                logloss = logloss/x.shape[0]
+
                 if self.model.classes == 1:
                     noise = self.model.noise.exp()
                     x = out
                     loss = self.loss_function(x, y, noise)
                 else:
-                    loss = self.loss_function(out[:, :1], y, out[:, 1:].exp())#/x.shape[0]
+                    loss = self.loss_function(out[:, :1], y, out[:, 1:].exp())
+                loss = loss/x.shape[0]
             else:
                 loss = self.loss_function(out, y)
+                out = torch.softmax(out, -1).mean(0)
                 out = out.argmax(dim=-1)
 
             progress_bar.set_postfix(ce_loss=loss.item(), kl_loss=logloss.item())

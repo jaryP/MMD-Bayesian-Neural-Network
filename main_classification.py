@@ -12,8 +12,10 @@ import random
 from shutil import copy
 import ANN
 import DropoutNet
-from base import ScaledMixtureGaussian, Gaussian, Laplace, Uniform
-from bayesian_utils import BayesianLinearLayer, BayesianCNNLayer
+from priors import Gaussian, Laplace, ScaledMixtureGaussian, Uniform
+from bayesian_layers import BayesianCNNLayer, BayesianLinearLayer
+import csv
+from itertools import cycle
 
 
 def get_dataset(name, batch_size, dev_split, resize=None):
@@ -52,6 +54,23 @@ def get_dataset(name, batch_size, dev_split, resize=None):
         test_split = torchvision.datasets.CIFAR10(root='./Datasets/CIFAR10', train=False,
                                                   download=True, transform=transform)
         classes = 10
+        sample = train_split[0][0]
+
+    if name == 'CIFAR100':
+        tr = [transforms.ToTensor(),
+              transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))]
+
+        if resize is not None:
+            tr.insert(0, transforms.Resize(resize))
+
+        transform = transforms.Compose(tr)
+
+        train_split = torchvision.datasets.CIFAR100(root='./Datasets/CIFAR100', train=True,
+                                                   download=True, transform=transform)
+
+        test_split = torchvision.datasets.CIFAR100(root='./Datasets/CIFAR100', train=False,
+                                                  download=True, transform=transform)
+        classes = 100
         sample = train_split[0][0]
 
     if dev_split > 0:
@@ -126,10 +145,29 @@ def main(experiment):
 
     Optimizers = ['sgd', 'adam', 'rmsprop']
     NetworkTypes = ['bbb', 'mmd', 'normal', 'dropout']
-    Datasets = ['fMNIST', 'MNIST', 'CIFAR10']
+    Datasets = ['fMNIST', 'MNIST', 'CIFAR10', 'CIFAR100']
     PosteriorType = ['layers', 'neurons', 'weights', 'multiplicative']
     LrScheduler = ['step', 'exponential', 'plateau']
     Priors = ['gaussian', 'laplace', 'uniform', 'scaledGaussian']
+
+    linestyle_tuple = [
+        # ('loosely dotted', (0, (1, 10))),
+        ('dotted', (0, (1, 1))),
+        # ('densely dotted', (0, (1, 1))),
+
+        # ('loosely dashed', (0, (5, 10))),
+        ('dashed', (0, (5, 5))),
+        ('densely dashed', (0, (5, 1))),
+
+        # ('loosely dashdotted', (0, (3, 10, 1, 10))),
+        ('dashdotted', (0, (3, 5, 1, 5))),
+        ('densely dashdotted', (0, (3, 1, 1, 1))),
+
+        ('dashdotdotted', (0, (3, 5, 1, 5, 1, 5))),
+        ('loosely dashdotdotted', (0, (3, 10, 1, 10, 1, 10))),
+        ('densely dashdotdotted', (0, (3, 1, 1, 1, 1, 1)))]
+
+    # linestyles = iter(linestyle_tuple)
 
     experiments_results = []
     adversarial_attack_results = []
@@ -174,6 +212,9 @@ def main(experiment):
         train_samples = data.get('train_samples', 2)
         test_samples = data.get('test_samples', 2)
         exp_name = data['exp_name']
+        if 'label' not in data:
+            data['label'] = exp_name
+
         save = data['save']
         load = data['load']
         dev_split = data.get('dev_split', 0)
@@ -186,7 +227,6 @@ def main(experiment):
         resize = data.get('resize', None)
         weight_decay = data.get('weight_decay', 0)
         lr_scheduler = data.get('lr_scheduler', None)
-
 
         # PRIORS
 
@@ -287,7 +327,6 @@ def main(experiment):
             model = base_model(prior=prior, mu_init=weights_mu_init, device=device,
                                rho_init=weights_rho_init, topology=topology, classes=classes, local_trick=local_trick,
                                sample=sample, **network_parameters, posterior_type=posterior_type)
-            # print(model)
             # init_model = deepcopy(model)
 
             model.to(device)
@@ -347,8 +386,8 @@ def main(experiment):
                 if scheduler is not None:
                     scheduler.load_state_dict(results['optimizer_state_dict'])
 
-                print(results.get('test_results')[1:])
-                print(results.get('train_results'))
+                # print(results.get('test_results')[1:])
+                # print(results.get('train_results'))
 
                 best_score = np.max(results.get('test_results'))
 
@@ -356,6 +395,7 @@ def main(experiment):
                     copy(os.path.join(current_load_path, 'best_model_{}.data'.format(e)), results_path)
 
             t = trainer(model, train_loader, test_loader, opt)
+            trained = False
 
             if early_stopping[1] < early_stopping_tolerance:
                 f1 = results.get('test_results', ['not calculated'])[-1]
@@ -365,6 +405,7 @@ def main(experiment):
                 progress_bar.set_postfix(f1_test=f1, f1_train=f1_train)
 
                 for i in progress_bar:
+                    trained = True
 
                     if i == 0:
                         (test_true, test_pred) = t.test_evaluation(samples=test_samples)
@@ -414,7 +455,6 @@ def main(experiment):
                         if save:
                             torch.save(t.model.state_dict(), best_path)
                     else:
-                        print(early_stopping)
                         early_stopping = (best_score, early_stopping[1] + 1)
 
                     results.update({
@@ -441,7 +481,20 @@ def main(experiment):
             run_results.append(results)
 
             # Reliability diagram and ECE
-            r = t.reliability_diagram(samples=test_samples)
+
+            if os.path.exists(os.path.join(current_path, "{}_temp_scaling.data".format(e))) and not trained:
+                with open(os.path.join(current_path, "{}_temp_scaling.data".format(e)), "rb") as f:
+                    r = pickle.load(f)
+            else:
+                r1 = t.reliability_diagram(samples=test_samples)
+                # r2 = t.temperature_scaling(samples=1)
+                r = (r1, r1)
+
+                with open(os.path.join(current_path, "{}_temp_scaling.data".format(e)), "wb") as f:
+                    pickle.dump(r, f)
+
+            print(r[0][-2])
+
             reliability.append(r)
 
             # Confusion matrix
@@ -450,7 +503,7 @@ def main(experiment):
             conf_matrix = confusion_matrix(true_class, pred_class)
             plt.matshow(conf_matrix)
             conf_matrices.append(conf_matrix)
-            plt.savefig(os.path.join(current_path, "{}_{}_conf_matrix.pdf".format(e, network)),
+            plt.savefig(os.path.join(current_path, "{}_conf_matrix.pdf".format(e)),
                         bbox_inches='tight')
 
             h1 = None
@@ -469,7 +522,7 @@ def main(experiment):
                 # attack1_path = os.path.join(current_path, 'attack1_{}.data'.format(e))
                 fgsm_path = os.path.join(current_path, 'fgsm_{}.data'.format(e))
 
-                if loaded:
+                if loaded and not trained:
                     # if os.path.exists(attack1_path):
                     #     with open(attack1_path, "rb") as f:
                     #         h1 = pickle.load(f)
@@ -496,13 +549,14 @@ def main(experiment):
                 # plt.figure()
                 covar = t.total_variance(samples=test_samples)
                 plt.matshow(covar)
-                plt.savefig(os.path.join(current_path, "{}_{}_prediction_covariance.pdf".format(e, network)),
+                plt.savefig(os.path.join(current_path, "{}_prediction_covariance.pdf".format(e)),
                             bbox_inches='tight')
                 # plt.close()
 
                 # a = np.trace(np.dot(conf_matrix.T, covar))
                 # b = np.trace(np.dot(conf_matrix.T, conf_matrix))*np.trace(np.dot(covar.T, covar))
                 # c = a/np.sqrt(b)
+                # print(c)
 
             local_rotate_res.append(h1)
             local_attack_res.append(h2)
@@ -511,14 +565,17 @@ def main(experiment):
             # ws_init = []
             to_hist = []
 
-            t.temperature_scaling(samples=test_samples)
-
             if network in ['bbb', 'mmd']:
-
+                # prior = 0
                 # last = None
+                labels = []
                 for layer in t.model.features:
                     wc = []
                     if isinstance(layer, (BayesianLinearLayer, BayesianCNNLayer)):
+                        labels.append('CNN' if isinstance(layer, BayesianCNNLayer) else 'Linear')
+
+                        # prior += layer.prior_prob(log=True).item()
+
                         w = layer.w
                         b = layer.b
 
@@ -539,6 +596,7 @@ def main(experiment):
 
                         ws.append(wc)
 
+                # print(np.exp(prior))
                 # for layer in init_model.features:
                 #     wc = []
                 #     if isinstance(layer, (BayesianLinearLayer, BayesianCNNLayer)):
@@ -574,12 +632,15 @@ def main(experiment):
 
                 fig, ax = plt.subplots()
 
+                ls = cycle(linestyle_tuple)
+
                 for l, w in enumerate(ws):
                     offset = np.abs(np.min(w) - np.max(w))*0.1
                     xs = np.linspace(np.min(w) - offset, np.max(w) + offset, 200)
                     density = gaussian_kde(w)
                     density._compute_covariance()
-                    plt.plot(xs, density(xs), label="Final weights layer {}".format(l + 1), linewidth=0.5)
+                    plt.plot(xs, density(xs), label="Layer #{}: {}".format(l + 1, labels[l]), linewidth=1,
+                             linestyle=next(ls)[1])
 
                 # xs = np.linspace(ws_init.min(), ws_init.max(), 200)
                 # density = gaussian_kde(ws_init)
@@ -595,7 +656,8 @@ def main(experiment):
                 #     # hist, _, _ = ax.hist(prior.sample(torch.Size([1000])).numpy(), bins=1000, linewidth=0.5, density=False,
                 #     #                      label="Prior", histtype='step')
 
-                plt.legend()
+                plt.legend(prop={'size': 10})
+                plt.xticks(fontsize=14)
                 fig.savefig(os.path.join(current_path, "{}_{}_posterior.pdf".format(e, network)),
                             bbox_inches='tight')
                 plt.close(fig)
@@ -627,19 +689,20 @@ def main(experiment):
 
     plt.close('all')
 
+    # Scores plot
     plt.figure(0)
 
     for i in range(len(experiments)):
         d = experiments[i]
         r = experiments_results[i]
-        ece = reliability[i][-2]
-        nll = reliability[i][-1]
+        # ece = reliability[i][-2]
+        # nll = reliability[i][-1]
 
-        res = [i['test_results'][1:] for i in r]
-        print('Exp: {}, max score:  {} (at epoch {}). '
-              'Training time: {} (s). Ece: {}, Nll: {}'.format(d.get('exp_name'),
-                                                      np.max(res), np.argmax(res),
-                                                      r[0].get('training_time', -1), ece, nll))
+        res = [i['test_results'] for i in r]
+        # print('Exp: {}, max score:  {} (at epoch {}). '
+        #       'Training time: {} (s). Ece: {}, Nll: {}'.format(d.get('exp_name'),
+        #                                               np.max(res), np.argmax(res),
+        #                                               r[0].get('training_time', -1), ece, nll))
 
         # print('Exp: {}, max score:  {}'.format(d.get('exp_name'), np.max(res)))
 
@@ -647,16 +710,16 @@ def main(experiment):
 
         # means = 100 - res.mean(0) * 100
         means = res.mean(0)
-        stds = means.std(0)
+        # stds = means.std(0)
 
         # print(means, np.argmax(means), means[:np.argmax(means)])
         means = means[:np.argmax(means)+1]
-        # stds = stds[:np.argmax(f1)]
+        # stds = stds[:np.argmax(means)+1]
 
         # save_path = d['save_path']
         plt.plot(range(len(means)), means, label=d.get('label', d['network_type']), c=d['color'], linewidth=0.1)
 
-        # plt.fill_between(range(len(f1)), f1 - stds, f1 + stds, alpha=0.1, color=d['color'])
+        # plt.fill_between(range(len(means)), means - stds, means + stds, alpha=0.1, color=d['color'])
 
         # for d, r in zip(experiments, experiments_results):
         #     res = [i['test_results'][1:] for i in r]
@@ -677,7 +740,7 @@ def main(experiment):
         #
         #     plt.legend()
 
-        plt.xticks(range(len(means)), [i + 1 for i in range(len(means))])
+        # plt.xticks(range(len(means)), [i + 1 for i in range(len(means))])
 
     plt.legend()
 
@@ -685,6 +748,28 @@ def main(experiment):
     plt.xlabel("Epochs")
     plt.savefig(os.path.join(experiments_path, "score.pdf"), bbox_inches='tight')
     plt.close('all')
+
+    # Results file writing
+    with open(os.path.join(experiments_path, 'results.csv'), 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["exp_name", "network", "max_score", "max_score_epoch", "ece", "scaled_ece"])
+
+        for i in range(len(experiments)):
+            d = experiments[i]
+            r = experiments_results[i]
+            ece = reliability[i][0][-2] * 100
+            new_ece = reliability[i][1][-2] * 100
+
+            res = [i['test_results'][1:] for i in r]
+            res = np.asarray(res) * 100
+
+            writer.writerow([d.get('exp_name'), d.get('network_type'), np.max(res), np.argmax(res), ece, new_ece])
+            # res = [i['test_results'][1:] for i in r]
+            # print('Exp: {}, max score:  {} (at epoch {}). '
+            #       'Training time: {} (s). Ece: {}, Nll: {}'.format(d.get('exp_name'),
+            #                                               np.max(res), np.argmax(res),
+            #                                               r[0].get('training_time', -1), ece, nll))
+
 
     # fig, ax = plt.subplots(nrows=1, ncols=1)
 
@@ -724,8 +809,10 @@ def main(experiment):
 
     ax1.plot([0, 1], [0, 1], "k:", label="Perfectly calibrated")
 
-    for d, (prob_pred, prob_true, ece, nll) in zip(experiments, reliability):
+    for d, ((prob_pred, prob_true, _, _), (prob_pred1, prob_true1, _, _)) in zip(experiments, reliability):
         ax1.plot(prob_pred, prob_true, "s-", label=d.get('label', d['network_type']), c=d['color'])
+        # ax1.plot(prob_pred1, prob_true1, "s--", label=d.get('label', d['network_type'])+'scaled', c=d['color'])
+
         # ax2.hist(prob_true, range=(0, 1), bins=50,
         #          histtype="step", lw=2)
 

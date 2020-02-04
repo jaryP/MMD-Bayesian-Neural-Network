@@ -73,12 +73,14 @@ class Trainer(Wrapper):
 
             if self.regression:
                 out = out.mean(0)
+
                 if self.model.classes == 1:
                     noise = self.model.noise.exp()
                     x = out
                     loss = self.loss_function(x, y, noise)
                 else:
-                    loss = self.loss_function(out[:, :1], y, out[:, 1:].exp())/x.shape[0]
+                    loss = self.loss_function(out[:, :1], y, out[:, 1:].exp())
+                loss = loss/x.shape[0]
             else:
                 loss = self.loss_function(out, y)
                 out = torch.softmax(out, -1).mean(0)

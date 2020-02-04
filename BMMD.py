@@ -3,69 +3,11 @@ from itertools import chain
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from tqdm import tqdm
 
-from base import Network, Gaussian, Wrapper, get_bayesian_network
-from bayesian_utils import BayesianCNNLayer, BayesianLinearLayer
-
-
-# def euclidean_dist( x, y):
-#     # x: N x D
-#     # y: M x D
-#     n = x.size(0)
-#     m = y.size(0)
-#     d = x.size(1)
-#     assert d == y.size(1)
-#
-#     # x = x.unsqueeze(1).expand(n, m, d)
-#     # y = y.unsqueeze(0).expand(n, m, d)
-#
-#     return torch.pow(torch.sub(x.unsqueeze(1).expand(n, m, d), y.unsqueeze(0).expand(n, m, d)), 2).sum(2)
-#
-#
-# def pairwise_distances(x, y):
-#
-#     x_norm = (x**2).sum(1).view(-1, 1)
-#     y_norm = (y ** 2).sum(1).view(1, -1)
-#
-#     dist = x_norm + y_norm - 2.0 * torch.mm(x, torch.transpose(y, 0, 1))
-#     return torch.clamp(dist, 0.0, np.inf)
-#
-#
-# def cdist2(x, y):
-#     # |x_i - y_j|_2^2 = <x_i - y_j, x_i - y_j> = <x_i, x_i> + <y_j, y_j> - 2*<x_i, y_j>
-#     x_sq_norm = x.pow(2).sum(dim=-1)
-#     y_sq_norm = y.pow(2).sum(dim=-1)
-#     x_dot_y = x @ y.t()
-#     sq_dist = x_sq_norm.unsqueeze(dim=1) + y_sq_norm.unsqueeze(dim=0) - 2*x_dot_y
-#     # For numerical issues
-#     sq_dist.clamp_(min=0.0)
-#     return torch.sqrt(sq_dist)
-#
-#
-# def compute_kernel(x, y):
-#     dim = x.size(1)
-#     # d = pairwise_distances(x, y)
-#     # print(d.size())
-#     # d = torch.exp(- torch.mul(torch.cdist(x, y).mean(1), 1/float(dim))).mean()
-#     d = torch.exp(- torch.mul(pairwise_distances(x, y).mean(1), 1/float(dim))).mean()
-#     # d = torch.exp(- torch.mul(pairwise_distances1(x, y).mean(1), 1/float(dim))).mean()
-#
-#     # d2 = cdist2(x, y)
-#     # d1 = torch.norm(x[:, None] - y, dim=2, p=2)
-#     # d = (- torch.norm(x[:, None] - y, dim=2, p=2).mean(1) / float(dim)).exp().mean()
-#     # d = (- row_pairwise_distances(x, y) / float(dim)).exp().mean().to(x.device)
-#     # d1 = x**2 + y**2 - 2*torch.matmul(x.t(), y)
-#     # d1 = torch.norm(x - y, 2)
-#     return d
-#
-#
-# def compute_mmd(x, y):
-#     x_kernel = compute_kernel(x, x)
-#     y_kernel = compute_kernel(y, y)
-#     xy_kernel = compute_kernel(x, y)
-#     return x_kernel + y_kernel - 2 * xy_kernel
+from base import Network, Wrapper, get_bayesian_network
+from priors import Gaussian
+from bayesian_layers import BayesianCNNLayer, BayesianLinearLayer
 
 
 class BMMD(Network):
@@ -170,7 +112,8 @@ class Trainer(Wrapper):
                     x = out
                     loss = self.loss_function(x, y, noise)
                 else:
-                    loss = self.loss_function(out[:, :1], y, out[:, 1:].exp())  # /x.shape[0]
+                    loss = self.loss_function(out[:, :1], y, out[:, 1:].exp())
+                loss = loss/x.shape[0]
             else:
                 loss = self.loss_function(out, y)
                 out = torch.softmax(out, -1).mean(0)

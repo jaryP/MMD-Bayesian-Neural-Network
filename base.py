@@ -6,12 +6,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as T
+from scipy.optimize import minimize
 from sklearn import metrics
+from sklearn.metrics import confusion_matrix
 from torch import optim
-from torch.distributions import Normal
+from torch.distributions import Exponential
 from tqdm import tqdm
 
-from bayesian_utils import BayesianCNNLayer, BayesianLinearLayer
+from bayesian_layers import BayesianCNNLayer, BayesianLinearLayer
 
 
 class percentageRotation:
@@ -43,7 +45,7 @@ class PixelShuffle:
             idx = np.arange(ln)
 
             pixels_map = \
-                zip(np.random.choice(idx, int(ln*self.percentage)), np.random.choice(idx, int(ln*self.percentage)))
+                zip(np.random.choice(idx, int(ln * self.percentage)), np.random.choice(idx, int(ln * self.percentage)))
 
             self.pixels_map = [(pxs[i], x1.getpixel(pxs[j])) for i, j in pixels_map]
 
@@ -80,7 +82,7 @@ def fgsm_attack(image, epsilon):
     # Collect the element-wise sign of the data gradient
     sign_data_grad = image.grad.data.sign()
     # Create the perturbed image by adjusting each pixel of the input image
-    perturbed_image = image + epsilon*sign_data_grad
+    perturbed_image = image + epsilon * sign_data_grad
     # Adding clipping to maintain [0,1] range
     perturbed_image = torch.clamp(perturbed_image, 0, 1)
     # Return the perturbed image
@@ -90,7 +92,7 @@ def fgsm_attack(image, epsilon):
 def log_gaussian_loss(out_dim):
     def loss_function(x, y, sigma):
         exponent = -0.5 * (x - y) ** 2 / sigma ** 2
-        log_coeff = -torch.log(sigma+1e-12) - 0.5 * np.log(2 * np.pi)
+        log_coeff = -torch.log(sigma + 1e-12) - 0.5 * np.log(2 * np.pi)
         return -(log_coeff + exponent).sum()
 
     return loss_function
@@ -102,43 +104,43 @@ def cross_entropy_loss(reduction):
         if _x.dim() == 3:
             _x = _x.mean(0)
         return F.nll_loss(_x, y, reduction=reduction)
+
     return loss_function
 
 
-def epistemic_aleatoric_variance(x):
-
-    if x.dim() == 2:
-        x = x.unsqueeze(0)
-
-    p = torch.softmax(x, -1)
-    p_hat = torch.mean(p, 0)
-    p = p.detach().cpu().numpy()
-    p_hat = p_hat.detach().cpu().numpy()
-
-    t = p.shape[0]
-    classes = p.shape[-1]
-
-    vars = []
-
-    for _p, _p_hat in zip(p, p_hat):
-        aleatoric = np.zeros((classes, classes))
-        epistemic = np.zeros((classes, classes))
-
-        for ip, ip_hat in zip(_p, _p_hat):
-            aleatoric += np.diag(ip) - np.outer(ip, ip)
-            d = ip - ip_hat
-            epistemic += np.outer(d, d)
-
-        aleatoric /= t
-        epistemic /= t
-
-        vars.append((aleatoric, epistemic))
-
-    return np.asarray(vars)
+# def epistemic_aleatoric_variance(x):
+#
+#     if x.dim() == 2:
+#         x = x.unsqueeze(0)
+#
+#     p = torch.softmax(x, -1)
+#     p_hat = torch.mean(p, 0)
+#     p = p.detach().cpu().numpy()
+#     p_hat = p_hat.detach().cpu().numpy()
+#
+#     t = p.shape[0]
+#     classes = p.shape[-1]
+#
+#     vars = []
+#
+#     for _p, _p_hat in zip(p, p_hat):
+#         aleatoric = np.zeros((classes, classes))
+#         epistemic = np.zeros((classes, classes))
+#
+#         for ip, ip_hat in zip(_p, _p_hat):
+#             aleatoric += np.diag(ip) - np.outer(ip, ip)
+#             d = ip - ip_hat
+#             epistemic += np.outer(d, d)
+#
+#         aleatoric /= t
+#         epistemic /= t
+#
+#         vars.append((aleatoric, epistemic))
+#
+#     return np.asarray(vars)
 
 
 def epistemic_aleatoric_uncertainty(x):
-
     if x.dim() == 2:
         x = x.unsqueeze(0)
 
@@ -155,7 +157,9 @@ def epistemic_aleatoric_uncertainty(x):
 
     determinants = []
     variances = []
-    I = np.eye(classes)
+    I = np.eye(classes) / t
+
+    const = t / 2 + t / 2 * np.log(2 * np.pi)
 
     for _bi in range(p.shape[0]):
         _bp = p[_bi]
@@ -168,13 +172,15 @@ def epistemic_aleatoric_uncertainty(x):
             aleatoric = np.diag(_p) - np.outer(_p, _p)
             d = _p - _bp_hat
             epistemic = np.outer(d, d)
-            variance += aleatoric + epistemic + I
+            variance += aleatoric + epistemic  # + I
 
-        variance = variance / t
+        variance = variance / t + I
+
         variances.append(variance)
 
-        det = np.linalg.det(variance)
+        det = 0.5 * np.log(np.linalg.det(variance)) + const
         determinants.append(det)
+        # print(det, end=' ')
 
     # for _p, _p_hat in zip(p, p_hat):
     #     variance = np.zeros((classes, classes))
@@ -202,12 +208,10 @@ def compute_entropy(preds, sum=True):
         return -torch.sum(l, 1)
     else:
         return -l
-    # return -(torch.log2(preds + 1e-10) * preds).sum(dim=1)
 
 
 def get_bayesian_network(topology, input_image, classes, mu_init, rho_init, prior, divergence, local_trick,
                          posterior_type, bias=True, **kwargs):
-
     features = torch.nn.ModuleList()
     # self._prior = prior
     # print(mu_init)
@@ -322,7 +326,7 @@ def get_network(topology, input_image, classes, bias=True):
 
             ll_conv = False
             size = i
-            l = torch.nn.Linear(prev, i)
+            l = torch.nn.Linear(prev, i, bias=bias)
             prev = size
         else:
             # 'Supported type for topology: \n' \
@@ -348,66 +352,6 @@ class Flatten(nn.Module):
         x = x.view(x.size()[0], -1)
         return x
 
-
-# PRIORS
-
-
-class Gaussian(object):
-    def __init__(self, mu=0, sigma=5):
-        self.mu = mu
-        self.sigma = sigma
-        self.inner_gaussian = Normal(mu, sigma)
-        # self.gaussian = torch.distributions.Normal(mu, sigma)
-
-    def sample(self, size):
-        return self.inner_gaussian.rsample(size)
-        # return self.mu + self.sigma * Normal(0, 1).sample(size)
-
-    def log_prob(self, x):
-        return self.inner_gaussian.log_prob(x)
-
-
-class Laplace(object):
-    def __init__(self, mu=0, scale=1):
-        self.mu = mu
-        self.scale = scale
-        self.distribution = torch.distributions.laplace.Laplace(mu, scale)
-
-    def sample(self, size):
-        return self.distribution.rsample(size)
-        # return self.mu + self.sigma * Normal(0, 1).sample(size)
-
-    def log_prob(self, x):
-        return self.distribution.log_prob(x)
-
-
-class ScaledMixtureGaussian(object):
-    def __init__(self, pi, s1, s2, mu1=0, mu2=0):
-        self.pi = pi
-        self.s1 = s1
-        self.s2 = s2
-        self.mu1 = mu1
-        self.mu2 = mu2
-        self.gaussian1 = Gaussian(mu1, s1)
-        self.gaussian2 = Gaussian(mu2, s2)
-
-    def sample(self, size):
-        return self.pi * self.gaussian1.sample(size) + (1 - self.pi) * self.gaussian2.sample(size)
-
-    def log_prob(self, x):
-        return self.pi * self.gaussian1.log_prob(x) + (1 - self.pi) * self.gaussian2.log_prob(x)
-
-
-class Uniform:
-    def __init__(self, a, b):
-        # self.dist = torch.distributions.uniform.Uniform(torch.tensor([float(a)]), torch.tensor([float(b)]))
-        self.dist = torch.distributions.uniform.Uniform(a, b)
-
-    def sample(self, size):
-        return self.dist.rsample(size)
-
-    def log_prob(self, x):
-        return self.dist.log_prob(x.cpu())
 
 # Utils
 
@@ -459,7 +403,7 @@ class Wrapper(ABC):
     def train_epoch(self, **kwargs):
         pass
 
-    def test_evaluation(self, samples, **kwargs):
+    def test_evaluation(self, samples, temperature=1, **kwargs):
 
         test_pred = []
         test_true = []
@@ -473,6 +417,8 @@ class Wrapper(ABC):
                 test_true.extend(y.tolist())
 
                 out = self.model.eval_forward(x.to(self.device), samples=samples)
+                out = torch.mul(out, temperature)
+
                 out = torch.softmax(out, -1)
 
                 if out.dim() > 2:
@@ -509,14 +455,13 @@ class Wrapper(ABC):
 
                     out = self.model.eval_forward(x.to(self.device), samples=samples)
 
-                    out = torch.softmax(out, -1)
-
                     a, _ = epistemic_aleatoric_uncertainty(out)
                     H.extend(a)
 
                     if out.dim() > 2:
                         out = out.mean(0)
 
+                    out = torch.softmax(out, -1)
                     pred_label.extend(out.argmax(dim=-1).tolist())
 
                     top_score, top_label = torch.topk(out, 2)
@@ -579,11 +524,12 @@ class Wrapper(ABC):
                     perturbed_data = fgsm_attack(x, eps)
 
                     out = self.model.eval_forward(perturbed_data, samples=samples)
-                    out = torch.softmax(out, -1)
+                    # out = torch.softmax(out, -1)
 
                     a, _ = epistemic_aleatoric_uncertainty(out)
                     H.extend(a)
 
+                    out = torch.softmax(out, -1)
                     if out.dim() > 2:
                         out = out.mean(0)
 
@@ -593,7 +539,11 @@ class Wrapper(ABC):
 
                     diff.extend(((top_score[:, 0] - top_score[:, 1]) ** 2).tolist())
 
-            H = np.mean(-np.log(H))
+            # H = np.mean(-np.log(H + 1e-12))
+            H = np.mean(H)
+            # H = np.log(np.mean(H))
+            # print(H)
+            # input(H)
 
             mean_diff = np.mean(diff)
 
@@ -603,7 +553,7 @@ class Wrapper(ABC):
 
         return HS, DIFF, scores
 
-    def reliability_diagram(self, samples=1, bins=20, scaling=1, **kwargs):
+    def reliability_diagram(self, samples=1, bins=15, scaling=1, **kwargs):
 
         y_prob = []
         y_true = []
@@ -616,6 +566,10 @@ class Wrapper(ABC):
                 x = x.to(self.device)
 
                 out = self.model.eval_forward(x.to(self.device), samples=samples)
+
+                if hasattr(out, '__call__') and hasattr(out, 'sample'):
+                    scaling = out.sample(out.size()[-1])
+
                 out = torch.div(out, scaling)
 
                 out = torch.softmax(out, -1)
@@ -623,7 +577,6 @@ class Wrapper(ABC):
                 if out.dim() > 2:
                     out = out.mean(0)
 
-                out = torch.mul(out, scaling)
                 prob, pred = torch.topk(out, 1, -1)
                 y_prob.extend(prob.tolist())
                 y_pred.extend(pred.tolist())
@@ -651,7 +604,7 @@ class Wrapper(ABC):
             prob_pred = np.hstack((prob_pred, conf))
             prob_true = np.hstack((prob_true, acc))
 
-            ece += s/len(y_true) * np.abs(acc - conf)
+            ece += s / len(y_true) * np.abs(acc - conf)
 
         return prob_pred, prob_true, ece, nll
 
@@ -664,62 +617,87 @@ class Wrapper(ABC):
             for i, (x, y) in enumerate(self.test_data):
                 x = x.to(self.device)
                 out = self.model.eval_forward(x, samples=samples)
-                out = torch.softmax(out, -1)
 
                 _, m = epistemic_aleatoric_uncertainty(out)
 
                 M.extend(m)
 
         M = np.asarray(M)
-        M = M.mean(0)  #+ np.eye(out.shape[-1])
+        M = M.mean(0)
 
         return M
 
     def temperature_scaling(self, samples=1, **kwargs):
         #  Based on https://github.com/gpleiss/temperature_scaling/
-        temperature = nn.Parameter(torch.ones(1, device=self.device) * 1.5, requires_grad=True)
+        temperature = nn.Parameter(torch.ones(10, device=self.device) * 1.5, requires_grad=True)
+        # temperature = Exponential(temp)
 
         self.model.eval()
-        logits_list = []
-        labels_list = []
-        nll_criterion = nn.CrossEntropyLoss().to(self.device)
 
-        with torch.no_grad():
+        nll_criterion = nn.CrossEntropyLoss()
+
+        _, _, before_ece, before_nll = self.reliability_diagram(samples=samples)
+
+        optimizer = optim.LBFGS([temperature], lr=0.05, max_iter=20)
+
+        def eval():
+
+            loss = 0
+
+            # with torch.no_grad():
             for i, (x, y) in tqdm(enumerate(self.test_data), leave=False, total=len(self.test_data)):
                 x = x.to(self.device)
                 y = y.to(self.device)
 
-                out = self.model.eval_forward(x.to(self.device), samples=samples)
-                # out = torch.softmax(out, -1)
+                with torch.no_grad():
+                    out = self.model.eval_forward(x.to(self.device), samples=samples)
+
+                out = torch.div(out, temperature)
 
                 if out.dim() > 2:
                     out = out.mean(0)
 
-                # out = out.argmax(dim=-1)
-                # out = out.sum(0)
-                # test_pred.ext end(out.tolist())
+                loss += nll_criterion(out, y)
 
-                # logits = self.model(x)
-                logits_list.extend(out)
-                labels_list.extend(y)
-
-        logits = torch.stack(logits_list).to(self.device)
-        labels = torch.stack(labels_list).to(self.device)
-
-        _, _, before_ece, before_nll = self.reliability_diagram(samples=samples)
-
-        optimizer = optim.LBFGS([temperature], lr=0.0 1, max_iter=100)
-
-        def eval():
-            _logits = logits / temperature
-            _logits = torch.div(logits, temperature)
-
-            loss = nll_criterion(_logits, labels)
+            loss = torch.div(loss, i)
             loss.backward()
+
+            #
+            #         logits_list.extend(out)
+            #         labels_list.extend(y)
+            #
+            #         # break
+            #
+            # logits = torch.stack(logits_list)  # .to(self.device)
+            # labels = torch.stack(labels_list)  # .to(self.device)
+
+            # print(logits.shape)
+            # logits = torch.div(logits, temperature)
+
+            # _, _, ece, _ = self.reliability_diagram(samples=samples, scaling=temperature)
+
+            # print(logits.size())
+            # if hasattr(temperature, 'sample'):
+            #     scaling = temperature.rsample()
+            #     input(scaling.sample())
+            # else:
+            #     scaling = temperature
+
+            # print(scaling)
+
+            # loss = nll_criterion(logits, labels)
+            # print(loss.item(), temperature.tolist())
+            # loss.backward()
+
             return loss
 
         optimizer.step(eval)
 
-        _, _, ece, nll = self.reliability_diagram(samples=samples, scaling=temperature.item())
+        a, b, ece, nll = self.reliability_diagram(samples=samples, scaling=temperature)
 
-        print(temperature.item(), before_ece*100, ece*100)
+        test_true, test_pred = self.test_evaluation(samples=samples)
+        f1 = metrics.f1_score(test_true, test_pred, average='micro')
+
+        print(temperature.tolist(), before_ece * 100, ece * 100, f1)
+
+        return a, b, ece, nll
