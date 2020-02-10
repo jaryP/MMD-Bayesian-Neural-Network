@@ -44,7 +44,7 @@ class Trainer(Wrapper):
         losses = []
 
         self.model.train()
-        progress_bar = tqdm(enumerate(self.train_data), total=len(self.train_data), disable=True)
+        progress_bar = tqdm(enumerate(self.train_data), total=len(self.train_data), disable=False, leave=False)
         # progress_bar.set_postfix(mmd_loss='not calculated', ce_loss='not calculated')
 
         train_true = []

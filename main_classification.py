@@ -18,6 +18,27 @@ import csv
 from itertools import cycle
 
 
+def unbalanced_mean_std(x):
+    m = []
+    std = []
+
+    mx = len(max(x, key=len))
+
+    res = np.zeros((len(x), mx), dtype=np.float)
+
+    for i, r in enumerate(x):
+        res[i, :len(r)] = r
+
+    res = np.asarray(res)
+
+    for i in res.T:
+        v = [_v for _v in i if _v > 0]
+        m.append(np.mean(v))
+        std.append(np.std(v))
+
+    return np.asarray(m), np.asarray(std)
+
+
 def get_dataset(name, batch_size, dev_split, resize=None):
     if name in ['fMNIST', 'MNIST']:
 
@@ -66,10 +87,10 @@ def get_dataset(name, batch_size, dev_split, resize=None):
         transform = transforms.Compose(tr)
 
         train_split = torchvision.datasets.CIFAR100(root='./Datasets/CIFAR100', train=True,
-                                                   download=True, transform=transform)
+                                                    download=True, transform=transform)
 
         test_split = torchvision.datasets.CIFAR100(root='./Datasets/CIFAR100', train=False,
-                                                  download=True, transform=transform)
+                                                   download=True, transform=transform)
         classes = 100
         sample = train_split[0][0]
 
@@ -92,42 +113,47 @@ def get_dataset(name, batch_size, dev_split, resize=None):
 
 
 def plot_test(exps, tests):
-    fig, ax = plt.subplots(nrows=2)
+    fig_corr, ax_corr = plt.subplots(nrows=1, figsize=(10,10))
+    fig_wro, ax_wro = plt.subplots(nrows=1, figsize=(10,10))
 
     for d, r in zip(exps, tests):
         if r[0] is None:
             continue
 
-        h, diff, scores = [], [], []
+        c, w = [], []
 
         for i in r:
-            h.append(i[0])
-            diff.append(i[1])
-            scores.append(i[2])
+            c.append(i[0])
+            w.append(i[1])
 
-        h = np.asarray(h).mean(0)
-        # diff = np.asarray(diff).mean(0)
-        scores = np.asarray(scores).mean(0)
+        h = np.asarray(c)
+        x = range(h.shape[1])
+        stds = np.std(h, 0)
+        h = h.mean(0)
+        # h = h/h[0]
+        ax_corr.plot(x, h, linestyle=d['linestyle'],
+                     label='{}'.format(d.get('label')), c=d['color'], linewidth=1.5)
+        ax_corr.fill_between(x, h - stds, h + stds, alpha=0.2, color=d['color'])
+        ax_corr.set_xticks(x)
+        # ax_corr.set_ylim([0, 1])
 
-        x = range(len(scores))
-        ax[0].plot(x, scores, label=d.get('label', d['network_type']), c=d['color'], linewidth=0.5)
-        ax[0].set_xticks(x)
+        h = np.asarray(w)
+        stds = np.std(h, 0)
+        h = h.mean(0)
+        # h = h/h[0]
+        ax_wro.plot(x, h, linestyle=d['linestyle'],
+                    label='{}'.format(d.get('label')), c=d['color'], linewidth=1.5)
+        ax_wro.fill_between(x, h - stds, h + stds, alpha=0.2, color=d['color'])
+        ax_wro.set_xticks(x)
+        # ax_wro.set_ylim([0, 1])
 
-        ax[1].plot(x, h,  # linestyle='--',
-                   label='{} uncertainty'.format(d.get('label', d['network_type'])), c=d['color'], linewidth=0.5)
-        ax[1].set_xticks(x)
+    handles, labels = ax_corr.get_legend_handles_labels()
+    fig_corr.legend(handles, labels, ncol=len(exps), loc='upper center', prop={'size': 25})
 
-        # ax[1].plot(x, h[:, 1], linestyle='-.',
-        #            label='{} uncertainty'.format(d.get('label', d['network_type'])), c=d['color'])
+    handles, labels = ax_wro.get_legend_handles_labels()
+    fig_wro.legend(handles, labels, ncol=len(exps), loc='upper center', prop={'size': 25})
 
-        # ax[2].plot(x, diff,
-        #            label='{} (top1-top2)**2'.format(d.get('label', d['network_type'])), c=d['color'])
-        # ax[2].set_xticks(x)
-
-    handles, labels = ax[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc='upper center')
-
-    return fig, ax
+    return (fig_corr, fig_wro), (ax_corr, ax_wro)
 
 
 def main(experiment):
@@ -150,35 +176,23 @@ def main(experiment):
     LrScheduler = ['step', 'exponential', 'plateau']
     Priors = ['gaussian', 'laplace', 'uniform', 'scaledGaussian']
 
-    linestyle_tuple = [
-        # ('loosely dotted', (0, (1, 10))),
-        ('dotted', (0, (1, 1))),
-        # ('densely dotted', (0, (1, 1))),
+    linestyles = ['--', '-.', '-', ':']
 
-        # ('loosely dashed', (0, (5, 10))),
-        ('dashed', (0, (5, 5))),
-        ('densely dashed', (0, (5, 1))),
-
-        # ('loosely dashdotted', (0, (3, 10, 1, 10))),
-        ('dashdotted', (0, (3, 5, 1, 5))),
-        ('densely dashdotted', (0, (3, 1, 1, 1))),
-
-        ('dashdotdotted', (0, (3, 5, 1, 5, 1, 5))),
-        ('loosely dashdotdotted', (0, (3, 10, 1, 10, 1, 10))),
-        ('densely dashdotdotted', (0, (3, 1, 1, 1, 1, 1)))]
-
-    # linestyles = iter(linestyle_tuple)
+    linestyles_cicle = cycle(linestyles)
 
     experiments_results = []
     adversarial_attack_results = []
     rotation_results = []
-    reliability = []
+    all_reliability = []
     conf_matrices = []
 
     hists = []
     all_ws = []
 
     experiments_path = experiment['experiments_path']
+
+    if not os.path.exists(experiments_path):
+        os.makedirs(experiments_path)
 
     experiments = experiment['experiments']
 
@@ -212,8 +226,12 @@ def main(experiment):
         train_samples = data.get('train_samples', 2)
         test_samples = data.get('test_samples', 2)
         exp_name = data['exp_name']
+
         if 'label' not in data:
             data['label'] = exp_name
+
+        if 'linestyle' not in data:
+            data['linestyle'] = next(linestyles_cicle)
 
         save = data['save']
         load = data['load']
@@ -299,19 +317,20 @@ def main(experiment):
             raise ValueError('Supported optimizers', Optimizers)
         else:
             if optimizer == 'sgd':
-                opt = torch.optim.SGD
+                _opt = torch.optim.SGD
 
             elif optimizer == 'adam':
-                opt = torch.optim.Adam
+                _opt = torch.optim.Adam
 
             elif optimizer == 'rmsprop':
-                opt = torch.optim.RMSprop
+                _opt = torch.optim.RMSprop
 
         run_results = []
         local_rotate_res = []
         local_attack_res = []
+        local_reliability = []
 
-        for e, seed in enumerate(seeds):
+        for e, seed in tqdm.tqdm(enumerate(seeds), total=len(seeds)):
 
             torch.manual_seed(seed)
             np.random.seed(seed)
@@ -332,9 +351,9 @@ def main(experiment):
             model.to(device)
 
             if optimizer != 'adam':
-                opt = opt(model.parameters(), lr=lr, momentum=moment, weight_decay=weight_decay)
+                opt = _opt(model.parameters(), lr=lr, momentum=moment, weight_decay=weight_decay)
             else:
-                opt = opt(model.parameters(), lr=lr, weight_decay=weight_decay)
+                opt = _opt(model.parameters(), lr=lr, weight_decay=weight_decay)
 
             scheduler = None
 
@@ -355,7 +374,7 @@ def main(experiment):
                 elif t == 'plateau':
                     tolerance, decay = lr_scheduler.get('tolerance', 2), lr_scheduler.get('decay', 0.1)
                     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=decay, verbose=True,
-                                                                              patience=tolerance, mode='max')
+                                                                           patience=tolerance, mode='max')
 
             current_path = os.path.join(save_path, exp_name)  # , str(e))
             current_load_path = os.path.join(load_path, exp_name)
@@ -401,7 +420,7 @@ def main(experiment):
                 f1 = results.get('test_results', ['not calculated'])[-1]
                 f1_train = results.get('train_results', ['not calculated'])[-1]
 
-                progress_bar = tqdm.tqdm(range(epoch_start, epochs), initial=epoch_start, total=epochs)
+                progress_bar = tqdm.tqdm(range(epoch_start, epochs), initial=epoch_start, total=epochs, leave=False)
                 progress_bar.set_postfix(f1_test=f1, f1_train=f1_train)
 
                 for i in progress_bar:
@@ -488,23 +507,20 @@ def main(experiment):
             else:
                 r1 = t.reliability_diagram(samples=test_samples)
                 # r2 = t.temperature_scaling(samples=1)
-                r = (r1, r1)
-
+                r = (r1[-2], r1[-2])
                 with open(os.path.join(current_path, "{}_temp_scaling.data".format(e)), "wb") as f:
                     pickle.dump(r, f)
 
-            print(r[0][-2])
+            local_reliability.append(r)
 
-            reliability.append(r)
-
-            # Confusion matrix
-            plt.close('all')
-            true_class, pred_class = t.test_evaluation(samples=test_samples)
-            conf_matrix = confusion_matrix(true_class, pred_class)
-            plt.matshow(conf_matrix)
-            conf_matrices.append(conf_matrix)
-            plt.savefig(os.path.join(current_path, "{}_conf_matrix.pdf".format(e)),
-                        bbox_inches='tight')
+            # # Confusion matrix
+            # plt.close('all')
+            # true_class, pred_class = t.test_evaluation(samples=test_samples)
+            # conf_matrix = confusion_matrix(true_class, pred_class)
+            # plt.matshow(conf_matrix)
+            # conf_matrices.append(conf_matrix)
+            # plt.savefig(os.path.join(current_path, "{}_conf_matrix.pdf".format(e)),
+            #             bbox_inches='tight')
 
             h1 = None
             h2 = None
@@ -566,101 +582,105 @@ def main(experiment):
             to_hist = []
 
             if network in ['bbb', 'mmd']:
-                # prior = 0
-                # last = None
-                labels = []
-                for layer in t.model.features:
-                    wc = []
-                    if isinstance(layer, (BayesianLinearLayer, BayesianCNNLayer)):
-                        labels.append('CNN' if isinstance(layer, BayesianCNNLayer) else 'Linear')
+                if trained or not os.path.exists(os.path.join(current_path, "{}_{}_posterior.pdf".format(e, network))):
+                    # prior = 0
+                    # last = None
+                    labels = []
+                    for layer in t.model.features:
+                        wc = []
+                        if isinstance(layer, (BayesianLinearLayer, BayesianCNNLayer)):
+                            labels.append('CNN' if isinstance(layer, BayesianCNNLayer) else 'Linear')
 
-                        # prior += layer.prior_prob(log=True).item()
+                            # prior += layer.prior_prob(log=True).item()
 
-                        w = layer.w
-                        b = layer.b
+                            w = layer.w
+                            b = layer.b
 
-                        mean = np.abs(w.mu.detach().cpu().numpy())
-                        std = w.sigma.detach().cpu().numpy()
-                        snr = mean / std
-                        to_hist.append(np.reshape(snr, -1))
-                        # ws.append(np.reshape(w.weights.detach().cpu().numpy(), -1))
-                        wc.extend(np.reshape(w.weights.detach().cpu().numpy(), -1))
-                        if b is not None:
-                            mean = np.abs(b.mu.detach().cpu().numpy())
-                            std = b.sigma.detach().cpu().numpy()
+                            mean = np.abs(w.mu.detach().cpu().numpy())
+                            std = w.sigma.detach().cpu().numpy()
                             snr = mean / std
                             to_hist.append(np.reshape(snr, -1))
-                            # to_hist.append(np.reshape(w.weights.detach().cpu().numpy(), -1))
-                            # ws.append(np.reshape(b.weights.detach().cpu().numpy(), -1))
-                            wc.extend(np.reshape(b.weights.detach().cpu().numpy(), -1))
+                            # ws.append(np.reshape(w.weights.detach().cpu().numpy(), -1))
+                            wc.extend(np.reshape(w.weights.detach().cpu().numpy(), -1))
+                            if b is not None:
+                                mean = np.abs(b.mu.detach().cpu().numpy())
+                                std = b.sigma.detach().cpu().numpy()
+                                snr = mean / std
+                                to_hist.append(np.reshape(snr, -1))
+                                # to_hist.append(np.reshape(w.weights.detach().cpu().numpy(), -1))
+                                # ws.append(np.reshape(b.weights.detach().cpu().numpy(), -1))
+                                wc.extend(np.reshape(b.weights.detach().cpu().numpy(), -1))
 
-                        ws.append(wc)
+                            ws.append(wc)
 
-                # print(np.exp(prior))
-                # for layer in init_model.features:
-                #     wc = []
-                #     if isinstance(layer, (BayesianLinearLayer, BayesianCNNLayer)):
-                #         w = layer.w
-                #         b = layer.b
-                #
-                #         # ws_init.append(np.reshape(w.weights.detach().cpu().numpy(), -1))
-                #         wc.extend(np.reshape(w.weights.detach().cpu().numpy(), -1))
-                #
-                #         if b is not None:
-                #             # ws_init.append(np.reshape(b.weights.detach().cpu().numpy(), -1))
-                #             wc.extend(np.reshape(b.weights.detach().cpu().numpy(), -1))
-                #
-                #         ws.append(np.asarray(wc))
-                # ws = np.concatenate(ws)
-                # ws_init = np.concatenate(ws_init)
+                    # print(np.exp(prior))
+                    # for layer in init_model.features:
+                    #     wc = []
+                    #     if isinstance(layer, (BayesianLinearLayer, BayesianCNNLayer)):
+                    #         w = layer.w
+                    #         b = layer.b
+                    #
+                    #         # ws_init.append(np.reshape(w.weights.detach().cpu().numpy(), -1))
+                    #         wc.extend(np.reshape(w.weights.detach().cpu().numpy(), -1))
+                    #
+                    #         if b is not None:
+                    #             # ws_init.append(np.reshape(b.weights.detach().cpu().numpy(), -1))
+                    #             wc.extend(np.reshape(b.weights.detach().cpu().numpy(), -1))
+                    #
+                    #         ws.append(np.asarray(wc))
+                    # ws = np.concatenate(ws)
+                    # ws_init = np.concatenate(ws_init)
 
-                to_hist = np.concatenate(to_hist)
-                hists.append(to_hist)
-                all_ws.append(ws)
+                    to_hist = np.concatenate(to_hist)
+                    hists.append(to_hist)
+                    all_ws.append(ws)
 
-                # else:
-                #     hists.append([])
-                #     for m in t.model.parameters():
-                #         ws.append(np.reshape(m.data.detach().cpu().numpy(), -1))
-                #
-                #     # for m in init_model.parameters():
-                #     #     ws_init.append(np.reshape(m.data.detach().cpu().numpy(), -1))
-                #
-                #     # ws = np.concatenate(ws)
-                #     ws_init = np.concatenate(ws_init)
-                plt.close('all')
+                    # else:
+                    #     hists.append([])
+                    #     for m in t.model.parameters():
+                    #         ws.append(np.reshape(m.data.detach().cpu().numpy(), -1))
+                    #
+                    #     # for m in init_model.parameters():
+                    #     #     ws_init.append(np.reshape(m.data.detach().cpu().numpy(), -1))
+                    #
+                    #     # ws = np.concatenate(ws)
+                    #     ws_init = np.concatenate(ws_init)
+                    plt.close('all')
 
-                fig, ax = plt.subplots()
+                    fig, ax = plt.subplots()
 
-                ls = cycle(linestyle_tuple)
+                    # ls = cycle(linestyle_tuple)
 
-                for l, w in enumerate(ws):
-                    offset = np.abs(np.min(w) - np.max(w))*0.1
-                    xs = np.linspace(np.min(w) - offset, np.max(w) + offset, 200)
-                    density = gaussian_kde(w)
-                    density._compute_covariance()
-                    plt.plot(xs, density(xs), label="Layer #{}: {}".format(l + 1, labels[l]), linewidth=1,
-                             linestyle=next(ls)[1])
+                    for l, w in enumerate(ws):
+                        offset = np.abs(np.min(w) - np.max(w)) * 0.1
+                        xs = np.linspace(np.min(w) - offset, np.max(w) + offset, 200)
+                        density = gaussian_kde(w)
+                        density._compute_covariance()
+                        plt.plot(xs, density(xs), label="Layer #{}: {}".format(l + 1, labels[l]), linewidth=1)
 
-                # xs = np.linspace(ws_init.min(), ws_init.max(), 200)
-                # density = gaussian_kde(ws_init)
-                # density._compute_covariance()
-                # plt.plot(xs, density(xs), label="Initial weights", linewidth=0.5)
+                    # xs = np.linspace(ws_init.min(), ws_init.max(), 200)
+                    # density = gaussian_kde(ws_init)
+                    # density._compute_covariance()
+                    # plt.plot(xs, density(xs), label="Initial weights", linewidth=0.5)
 
-                # if network in ['bbb', 'mmd']:
-                #     s = prior.sample(torch.Size([5000])).numpy()
-                #     xs = np.linspace(s.min(), s.max(), 200)
-                #     density = gaussian_kde(s)
-                #     # # density._compute_covariance()
-                #     plt.plot(xs, density(xs), label="Prior", linewidth=0.5)
-                #     # hist, _, _ = ax.hist(prior.sample(torch.Size([1000])).numpy(), bins=1000, linewidth=0.5, density=False,
-                #     #                      label="Prior", histtype='step')
+                    # if network in ['bbb', 'mmd']:
+                    #     s = prior.sample(torch.Size([5000])).numpy()
+                    #     xs = np.linspace(s.min(), s.max(), 200)
+                    #     density = gaussian_kde(s)
+                    #     # # density._compute_covariance()
+                    #     plt.plot(xs, density(xs), label="Prior", linewidth=0.5)
+                    #     # hist, _, _ = ax.hist(prior.sample(torch.Size([1000])).numpy(), bins=1000, linewidth=0.5, density=False,
+                    #     #                      label="Prior", histtype='step')
 
-                plt.legend(prop={'size': 10})
-                plt.xticks(fontsize=14)
-                fig.savefig(os.path.join(current_path, "{}_{}_posterior.pdf".format(e, network)),
-                            bbox_inches='tight')
-                plt.close(fig)
+                    # plt.legend(prop={'size': 10})
+
+                    plt.xticks(fontsize=14)
+                    plt.yticks(fontsize=14)
+                    fig.savefig(os.path.join(current_path, "{}_{}_posterior.pdf".format(e, network)),
+                                bbox_inches='tight')
+                    plt.close(fig)
+
+        all_reliability.append(local_reliability)
 
         rotation_results.append(local_rotate_res)
         adversarial_attack_results.append(local_attack_res)
@@ -668,6 +688,7 @@ def main(experiment):
         # print('-' * 200)
         experiments_results.append(run_results)
 
+    all_reliability = np.asarray(all_reliability)
     # input(reliability)
     experiments = [e for e in experiments if not e.get('skip', False)]
 
@@ -680,12 +701,19 @@ def main(experiment):
     # plt.close(fig)
     plt.close('all')
 
+    # PLOT FGSM
     fig, ax = plot_test(experiments, adversarial_attack_results)
-    for a in ax:
-        a.set_xticklabels(ANN.Trainer.epsilons, fontsize=8)
+    # for a in ax:
+    ax[0].set_xticklabels(ANN.Trainer.epsilons, fontsize=8)
+    ax[1].set_xticklabels(ANN.Trainer.epsilons, fontsize=8)
 
-    fig.savefig(os.path.join(experiments_path, "fgsa.pdf"), bbox_inches='tight')
-    plt.close(fig)
+    ax[0].xaxis.set_tick_params(labelsize=25)
+    ax[0].yaxis.set_tick_params(labelsize=25)
+    ax[1].xaxis.set_tick_params(labelsize=25)
+    ax[1].yaxis.set_tick_params(labelsize=25)
+
+    fig[0].savefig(os.path.join(experiments_path, "fgsm_correct_class.pdf"), bbox_inches='tight')
+    fig[1].savefig(os.path.join(experiments_path, "fgsm_wrong_class.pdf"), bbox_inches='tight')
 
     plt.close('all')
 
@@ -699,27 +727,39 @@ def main(experiment):
         # nll = reliability[i][-1]
 
         res = [i['test_results'] for i in r]
-        # print('Exp: {}, max score:  {} (at epoch {}). '
-        #       'Training time: {} (s). Ece: {}, Nll: {}'.format(d.get('exp_name'),
-        #                                               np.max(res), np.argmax(res),
-        #                                               r[0].get('training_time', -1), ece, nll))
 
-        # print('Exp: {}, max score:  {}'.format(d.get('exp_name'), np.max(res)))
+        # mx = len(max(_res, key=len))
+        # # print('Exp: {}, max score:  {} (at epoch {}). '
+        # #       'Training time: {} (s). Ece: {}, Nll: {}'.format(d.get('exp_name'),
+        # #                                               np.max(res), np.argmax(res),
+        # #                                               r[0].get('training_time', -1), ece, nll))
+        #
+        # # print('Exp: {}, max score:  {}'.format(d.get('exp_name'), np.max(res)))
+        #
+        # res = np.zeros((len(_res), mx), dtype=np.float)
+        #
+        # for i, r in enumerate(_res):
+        #     res[i, :len(r)] = r
+        #
+        # res = np.asarray(res)
 
-        res = np.asarray(res)
+        means, stds = unbalanced_mean_std(res)
 
-        # means = 100 - res.mean(0) * 100
-        means = res.mean(0)
-        # stds = means.std(0)
+        # # means = 100 - res.mean(0) * 100
+        # # means = res.mean(0)
+        # means = np.average(res, weights=(res > 0), axis=0)
+        #
+        # mask = res > 0
+        # stds = np.ma.masked_where(mask, res).std(axis=0)
+        # means = means[:np.argmax(means)+1]
 
-        # print(means, np.argmax(means), means[:np.argmax(means)])
-        means = means[:np.argmax(means)+1]
         # stds = stds[:np.argmax(means)+1]
 
         # save_path = d['save_path']
-        plt.plot(range(len(means)), means, label=d.get('label', d['network_type']), c=d['color'], linewidth=0.1)
+        plt.plot(range(len(means)), means, linestyle=d['linestyle'],
+                 label=d.get('label', d['network_type']), c=d['color'], linewidth=2)
 
-        # plt.fill_between(range(len(means)), means - stds, means + stds, alpha=0.1, color=d['color'])
+        plt.fill_between(range(len(means)), means - stds, means + stds, alpha=0.1, color=d['color'])
 
         # for d, r in zip(experiments, experiments_results):
         #     res = [i['test_results'][1:] for i in r]
@@ -744,7 +784,7 @@ def main(experiment):
 
     plt.legend()
 
-    plt.ylabel("Error test (%)")
+    plt.ylabel("Test score (%)")
     plt.xlabel("Epochs")
     plt.savefig(os.path.join(experiments_path, "score.pdf"), bbox_inches='tight')
     plt.close('all')
@@ -757,19 +797,33 @@ def main(experiment):
         for i in range(len(experiments)):
             d = experiments[i]
             r = experiments_results[i]
-            ece = reliability[i][0][-2] * 100
-            new_ece = reliability[i][1][-2] * 100
 
-            res = [i['test_results'][1:] for i in r]
-            res = np.asarray(res) * 100
+            ece = all_reliability[i, :, 0] * 100
 
-            writer.writerow([d.get('exp_name'), d.get('network_type'), np.max(res), np.argmax(res), ece, new_ece])
+            # ece = reliability[i][0][-2] * 100
+            # new_ece = reliability[i][1][-2] * 100
+
+            # eces = [reliability[i][j][-2] * 100 for j in range(reliability[i])]
+            # print(eces)
+
+            res = [i['test_results'] for i in r]
+            res, res_std = unbalanced_mean_std(res)
+            # res = np.asarray(res) * 100
+            # print(res_std)
+
+            res_i = np.argmax(res)
+
+            writer.writerow([d.get('label'), d.get('network_type'),
+                             '{} +- {}'.format(res[res_i] * 100, res_std[res_i] * 100),
+                             res_i,
+                             '{} +- {}'.format(np.mean(ece), np.std(ece)),
+                             '{} +- {}'.format(np.mean(ece), np.std(ece))])
+
             # res = [i['test_results'][1:] for i in r]
             # print('Exp: {}, max score:  {} (at epoch {}). '
             #       'Training time: {} (s). Ece: {}, Nll: {}'.format(d.get('exp_name'),
             #                                               np.max(res), np.argmax(res),
             #                                               r[0].get('training_time', -1), ece, nll))
-
 
     # fig, ax = plt.subplots(nrows=1, ncols=1)
 
@@ -800,28 +854,29 @@ def main(experiment):
     # ax1.plot([0, 1], [0, 1], "k:", label="Perfectly calibrated")
 
     # ax1.legend(loc='upper left')
-    plt.close('all')
-
-    fig = plt.figure(1, figsize=(10, 10))
-
-    ax1 = plt.subplot2grid((3, 1), (0, 0), rowspan=2)
-    # ax2 = plt.subplot2grid((3, 1), (2, 0))
-
-    ax1.plot([0, 1], [0, 1], "k:", label="Perfectly calibrated")
-
-    for d, ((prob_pred, prob_true, _, _), (prob_pred1, prob_true1, _, _)) in zip(experiments, reliability):
-        ax1.plot(prob_pred, prob_true, "s-", label=d.get('label', d['network_type']), c=d['color'])
-        # ax1.plot(prob_pred1, prob_true1, "s--", label=d.get('label', d['network_type'])+'scaled', c=d['color'])
-
-        # ax2.hist(prob_true, range=(0, 1), bins=50,
-        #          histtype="step", lw=2)
-
-        # print('Exp: {}, ece: {}'.format(d.get('exp_name'), ece))
-
-    ax1.legend(loc='upper left')
-
-    fig.savefig(os.path.join(experiments_path, "calibration_curve.pdf"), bbox_inches='tight')
-    plt.close('all')
+    # plt.close('all')
+    #
+    # fig = plt.figure(1, figsize=(10, 10))
+    #
+    # ax1 = plt.subplot2grid((3, 1), (0, 0), rowspan=2)
+    # # ax2 = plt.subplot2grid((3, 1), (2, 0))
+    #
+    # ax1.plot([0, 1], [0, 1], "-", label="Perfectly calibrated", linewidth=1, c='k')
+    #
+    # for d, ((prob_pred, prob_true, _, _), (prob_pred1, prob_true1, _, _)) in zip(experiments, reliability):
+    #     ax1.plot(prob_pred, prob_true, d['linestyle'], label=d.get('label', d['network_type']), c=d['color'],
+    #              linewidth=2)
+    #     # ax1.plot(prob_pred1, prob_true1, "s--", label=d.get('label', d['network_type'])+'scaled', c=d['color'])
+    #
+    #     # ax2.hist(prob_true, range=(0, 1), bins=50,
+    #     #          histtype="step", lw=2)
+    #
+    #     # print('Exp: {}, ece: {}'.format(d.get('exp_name'), ece))
+    #
+    # ax1.legend(loc='upper left')
+    #
+    # fig.savefig(os.path.join(experiments_path, "calibration_curve.pdf"), bbox_inches='tight')
+    # plt.close('all')
 
     return experiments_results
 

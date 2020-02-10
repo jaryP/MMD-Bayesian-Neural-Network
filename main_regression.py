@@ -157,7 +157,7 @@ def main(experiment):
         variance = data['variance']
         noise = data['noise']
         points_range = data.get('range', [-10, 10])
-        batch_size = data.get('batch_size', regression_points//4)
+        batch_size = data.get('batch_size', regression_points//5)
 
         # PRIORS
 
@@ -339,6 +339,8 @@ def main(experiment):
             plt.plot(x_true, y_pred)
             offset = np.abs(mn - mx) * 0.1
             plt.ylim(mn - offset, mx + offset)
+            plt.xticks(fontsize=15)
+            plt.yticks(fontsize=17)
             plt.savefig(os.path.join(save_path, "{}_{}.pdf".format(e, network)), bbox_inches='tight')
             plt.close()
 

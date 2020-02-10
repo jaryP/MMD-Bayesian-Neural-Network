@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from copy import copy
+from itertools import permutations
 
 import numpy as np
 import torch
@@ -144,7 +145,7 @@ def epistemic_aleatoric_uncertainty(x):
     if x.dim() == 2:
         x = x.unsqueeze(0)
 
-    p = torch.softmax(x, -1)
+    p = torch.softmax(x, 2)
     p_hat = torch.mean(p, 0)
 
     p = p.detach().cpu().numpy()
@@ -157,47 +158,40 @@ def epistemic_aleatoric_uncertainty(x):
 
     determinants = []
     variances = []
-    I = np.eye(classes) / t
 
-    const = t / 2 + t / 2 * np.log(2 * np.pi)
+    mn = 1 / classes ** classes
+    mx = mn * (2 ** (classes - 1))
 
     for _bi in range(p.shape[0]):
         _bp = p[_bi]
         _bp_hat = p_hat[_bi]
 
-        variance = np.zeros((classes, classes))
+        al = np.zeros((classes, classes))
+        ep = np.zeros((classes, classes))
 
         for i in range(t):
             _p = _bp[i]
             aleatoric = np.diag(_p) - np.outer(_p, _p)
+            al += aleatoric
             d = _p - _bp_hat
             epistemic = np.outer(d, d)
-            variance += aleatoric + epistemic  # + I
+            ep += epistemic
 
-        variance = variance / t + I
+        al /= t
+        ep /= t
 
-        variances.append(variance)
+        var = al + ep
 
-        det = 0.5 * np.log(np.linalg.det(variance)) + const
+        variances.append(var)
+
+        det = np.linalg.det(var + (np.eye(classes) / classes))
+
+        det = (det - mn) / (mx - mn)
         determinants.append(det)
-        # print(det, end=' ')
 
-    # for _p, _p_hat in zip(p, p_hat):
-    #     variance = np.zeros((classes, classes))
-    #
-    #     for ip, ip_hat in zip(_p, _p_hat):
-    #         aleatoric = np.diag(ip) - np.outer(ip, ip)
-    #         d = ip - ip_hat
-    #         epistemic = np.outer(d, d)
-    #
-    #         variance += aleatoric + epistemic
-    #
-    #     variance = variance/t
-    #
-    #     det = np.linalg.det(variance)
-    #
-    #     variances.append(variance)
-    #     determinants.append(det)
+
+    determinants = np.asarray(determinants)
+    variances = np.asarray(variances)
 
     return determinants, variances
 
@@ -231,6 +225,9 @@ def get_bayesian_network(topology, input_image, classes, mu_init, rho_init, prio
 
         elif isinstance(i, str) and i.lower() == 'relu':
             l = torch.nn.ReLU()
+
+        elif isinstance(i, str) and i.lower() == 'sigmoid':
+            l = torch.nn.Sigmoid()
 
         elif isinstance(i, float):
             l = torch.nn.Dropout(p=0.5)
@@ -377,7 +374,7 @@ class Network(nn.Module, ABC):
 
 
 class Wrapper(ABC):
-    epsilons = [0, 0.01, 0.05, .1]  # , .2, .5]
+    epsilons = [0, 0.001, 0.005, 0.01, 0.05]  # , .2, .5]
     shuffle_percentage = [0, .1, .2, .5, .8]
 
     def __init__(self, model: nn.Module, train_data, test_data, optimizer):
@@ -492,19 +489,17 @@ class Wrapper(ABC):
 
     def fgsm_test(self, samples=1):
 
-        HS = []
-        DIFF = []
-        scores = []
+        correctly_predicted = []
+        wrongly_predicted = []
 
         self.model.eval()
         loss = cross_entropy_loss('mean')
 
-        for eps in tqdm(self.epsilons, desc='Attack test'):
+        for eps in tqdm(self.epsilons, desc='Attack test', leave=False):
 
             H = []
             pred_label = []
             true_label = []
-            diff = []
 
             self.model.eval()
             for i, (x, y) in enumerate(self.test_data):
@@ -524,7 +519,6 @@ class Wrapper(ABC):
                     perturbed_data = fgsm_attack(x, eps)
 
                     out = self.model.eval_forward(perturbed_data, samples=samples)
-                    # out = torch.softmax(out, -1)
 
                     a, _ = epistemic_aleatoric_uncertainty(out)
                     H.extend(a)
@@ -535,23 +529,28 @@ class Wrapper(ABC):
 
                     pred_label.extend(out.argmax(dim=-1).tolist())
 
-                    top_score, top_label = torch.topk(out, 2)
-
-                    diff.extend(((top_score[:, 0] - top_score[:, 1]) ** 2).tolist())
+                    # top_score, top_label = torch.topk(out, 2)
 
             # H = np.mean(-np.log(H + 1e-12))
-            H = np.mean(H)
-            # H = np.log(np.mean(H))
-            # print(H)
-            # input(H)
 
-            mean_diff = np.mean(diff)
+            # print(np.mean([H[i] for i in range(len(true_label)) if true_label[i] == pred_label[i]]))
+            # print(np.mean([H[i] for i in range(len(true_label)) if true_label[i] != pred_label[i]]))
 
-            HS.append(H)
-            DIFF.append(mean_diff)
-            scores.append(metrics.f1_score(true_label, pred_label, average='micro'))
+            _correctly_predicted = []
+            _wrongly_predicted = []
 
-        return HS, DIFF, scores
+            for i in range(len(true_label)):
+                if true_label[i] == pred_label[i]:
+                    _correctly_predicted.append(H[i])
+                else:
+                    _wrongly_predicted.append(H[i])
+
+            correctly_predicted.append(np.mean(_correctly_predicted))
+            wrongly_predicted.append(np.mean(_wrongly_predicted))
+
+        # correctly_predicted, wrongly_predicted = np.asarray(correctly_predicted), np.asarray(wrongly_predicted)
+
+        return correctly_predicted, wrongly_predicted
 
     def reliability_diagram(self, samples=1, bins=15, scaling=1, **kwargs):
 
@@ -701,3 +700,82 @@ class Wrapper(ABC):
         print(temperature.tolist(), before_ece * 100, ece * 100, f1)
 
         return a, b, ece, nll
+
+
+if __name__ == '__main__':
+
+    def prova(inp):
+        if inp.dim() == 2:
+            inp = inp.unsqueeze(0)
+
+        p = inp
+        p_hat = torch.mean(p, 0)
+
+        p = p.detach().cpu().numpy()
+        p = np.transpose(p, (1, 0, 2))
+
+        p_hat = p_hat.detach().cpu().numpy()
+
+        t = p.shape[1]
+        classes = p.shape[-1]
+
+        determinants = []
+        variances = []
+
+        mn = 1/classes**classes
+        mx = mn * (2**(classes-1))
+
+        for _bi in range(p.shape[0]):
+            _bp = p[_bi]
+            _bp_hat = p_hat[_bi]
+
+            al = np.zeros((classes, classes))
+            ep = np.zeros((classes, classes))
+
+            for i in range(t):
+                _p = _bp[i]
+                aleatoric = np.diag(_p) - np.outer(_p, _p)
+                al += aleatoric
+                d = _p - _bp_hat
+                epistemic = np.outer(d, d)
+                ep += epistemic
+
+            al /= t
+            ep /= t
+
+            print(al+ep)
+            variances.append(al+ep+(np.eye(classes) / classes))
+
+            det = np.linalg.det(variances[-1])
+
+            det = (det - mn) / (mx-mn)
+            determinants.append(det)
+
+        determinants = np.asarray(determinants)
+        variances = np.asarray(variances)
+
+        return determinants, variances
+
+    x = torch.tensor(
+        [
+            [
+                [.25, .25, .25, .25],
+            ]
+        ],
+        dtype=torch.float
+    ).permute(1, 0, 2)
+
+    print(x.shape)
+    d = (1/x.shape[-1])**x.shape[-1]
+    print(d)
+
+    a, b = prova(x)
+    print(a)
+
+    # a, _ = epistemic_aleatoric_uncertainty(x)
+    # print(a)
+
+    # print(len(list(permutations( [[1, 0, 0, 0 ],
+    #             [0, 1, 0, 0],
+    #             [0, 0, 1, 0],
+    #             [0, 0, 0, 1]]))))
