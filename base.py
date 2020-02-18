@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from copy import copy
+from copy import copy, deepcopy
 from itertools import permutations
 
 import numpy as np
@@ -140,6 +140,18 @@ def cross_entropy_loss(reduction):
 #
 #     return np.asarray(vars)
 
+def det(x):
+    t = x.shape[1]
+    classes = x.shape[-1]
+
+    mn = 1 / classes ** classes
+    mx = mn * (2 ** (classes - 1))
+
+    det = np.linalg.det(x + (np.eye(classes) / classes))
+    det = (det - mn) / (mx - mn)
+
+    return det
+
 
 def epistemic_aleatoric_uncertainty(x):
     if x.dim() == 2:
@@ -185,15 +197,34 @@ def epistemic_aleatoric_uncertainty(x):
         variances.append(var)
 
         det = np.linalg.det(var + (np.eye(classes) / classes))
-
         det = (det - mn) / (mx - mn)
-        determinants.append(det)
 
+        determinants.append(det)
 
     determinants = np.asarray(determinants)
     variances = np.asarray(variances)
 
     return determinants, variances
+
+
+def entropy(x):
+    if x.dim() == 2:
+        x = x.unsqueeze(0)
+
+    p = torch.softmax(x, 2)
+    classes = p.shape[-1]
+
+    log_p = -torch.sum(p * torch.log(p + 1e-12), -1)/np.log(classes)
+    _entropy = torch.mean(log_p, 0)
+
+    # p = p.detach().cpu().numpy()
+
+    # classes = p.shape[-1]
+
+    # log_p = -np.sum(p * np.log(p + 1e-12), -1)/np.log(classes)
+    # _entropy = np.sum(log_p, 0)
+
+    return _entropy.tolist(), None
 
 
 def compute_entropy(preds, sum=True):
@@ -374,8 +405,11 @@ class Network(nn.Module, ABC):
 
 
 class Wrapper(ABC):
-    epsilons = [0, 0.001, 0.005, 0.01, 0.05]  # , .2, .5]
+    epsilons = [0, .001, .005, .01, .05, .1, .2, .3]  # , 0.005, 0.01, 0.05]  # , .2, .5]
+    # epsilons = [0, 0.01, 0.005, 0.1]  # , 0.005, 0.01, 0.05]  # , .2, .5]
     shuffle_percentage = [0, .1, .2, .5, .8]
+    noise = [0, 0.01, 0.05, 0.1, .2, .3, .4, .5, .6, .7, .8]  # , 0.005, 0.01, 0.05]  # , .2, .5]
+    # noise = [0, .5]  # , 0.005, 0.01, 0.05]  # , .2, .5]
 
     def __init__(self, model: nn.Module, train_data, test_data, optimizer):
         self.model = model
@@ -429,15 +463,15 @@ class Wrapper(ABC):
 
     def shuffle_test(self, samples=1):
 
-        ts_copy = copy(self.test_data.dataset.transform)
+        ts_copy = deepcopy(self.test_data.dataset.transform)
 
         HS = []
         DIFF = []
         scores = []
         self.model.eval()
 
-        for percentage in tqdm(self.shuffle_percentage, desc='Pixel Shuffle test'):
-            ts = T.Compose([PixelShuffle(percentage), ts_copy])
+        for n in tqdm(self.noise, desc='Pixel Shuffle test'):
+            ts = T.Compose([PixelShuffle(n), ts_copy])
             self.test_data.dataset.transform = ts
 
             H = []
@@ -492,12 +526,16 @@ class Wrapper(ABC):
         correctly_predicted = []
         wrongly_predicted = []
 
+        correctly_predicted_h = []
+        wrongly_predicted_h = []
+
         self.model.eval()
         loss = cross_entropy_loss('mean')
 
         for eps in tqdm(self.epsilons, desc='Attack test', leave=False):
 
             H = []
+            He = []
             pred_label = []
             true_label = []
 
@@ -511,7 +549,7 @@ class Wrapper(ABC):
                 self.model.zero_grad()
                 x.requires_grad = True
 
-                out = self.model.eval_forward(x.to(self.device), samples=samples)
+                out = self.model.eval_forward(x.to(self.device), samples=1)
                 ce = loss(out, y)
                 ce.backward()
 
@@ -523,18 +561,14 @@ class Wrapper(ABC):
                     a, _ = epistemic_aleatoric_uncertainty(out)
                     H.extend(a)
 
+                    a, _ = entropy(out)
+                    He.extend(a)
+
                     out = torch.softmax(out, -1)
                     if out.dim() > 2:
                         out = out.mean(0)
 
                     pred_label.extend(out.argmax(dim=-1).tolist())
-
-                    # top_score, top_label = torch.topk(out, 2)
-
-            # H = np.mean(-np.log(H + 1e-12))
-
-            # print(np.mean([H[i] for i in range(len(true_label)) if true_label[i] == pred_label[i]]))
-            # print(np.mean([H[i] for i in range(len(true_label)) if true_label[i] != pred_label[i]]))
 
             _correctly_predicted = []
             _wrongly_predicted = []
@@ -545,12 +579,159 @@ class Wrapper(ABC):
                 else:
                     _wrongly_predicted.append(H[i])
 
-            correctly_predicted.append(np.mean(_correctly_predicted))
-            wrongly_predicted.append(np.mean(_wrongly_predicted))
+            correctly_predicted.append(_correctly_predicted)
+            wrongly_predicted.append(_wrongly_predicted)
 
+            _correctly_predicted = []
+            _wrongly_predicted = []
+
+            for i in range(len(true_label)):
+                if true_label[i] == pred_label[i]:
+                    _correctly_predicted.append(He[i])
+                else:
+                    _wrongly_predicted.append(He[i])
+
+            correctly_predicted_h.append(_correctly_predicted)
+            wrongly_predicted_h.append(_wrongly_predicted)
         # correctly_predicted, wrongly_predicted = np.asarray(correctly_predicted), np.asarray(wrongly_predicted)
 
-        return correctly_predicted, wrongly_predicted
+        return (correctly_predicted, wrongly_predicted), (correctly_predicted_h, wrongly_predicted_h)
+
+    # def fgsm_test_entropy(self, samples=1):
+    #
+    #     correctly_predicted = []
+    #     wrongly_predicted = []
+    #
+    #     self.model.eval()
+    #     loss = cross_entropy_loss('mean')
+    #
+    #     for eps in tqdm(self.epsilons, desc='Attack test', leave=False):
+    #
+    #         H = []
+    #         pred_label = []
+    #         true_label = []
+    #
+    #         self.model.eval()
+    #         for i, (x, y) in enumerate(self.test_data):
+    #             true_label.extend(y.tolist())
+    #
+    #             x = x.to(self.device)
+    #             y = y.to(self.device)
+    #
+    #             self.model.zero_grad()
+    #             x.requires_grad = True
+    #
+    #             out = self.model.eval_forward(x.to(self.device), samples=samples)
+    #             ce = loss(out, y)
+    #             ce.backward()
+    #
+    #             with torch.no_grad():
+    #                 perturbed_data = fgsm_attack(x, eps)
+    #
+    #                 out = self.model.eval_forward(perturbed_data, samples=samples)
+    #
+    #                 a, _ = entropy(out)
+    #                 H.extend(a)
+    #
+    #                 out = torch.softmax(out, -1)
+    #                 if out.dim() > 2:
+    #                     out = out.mean(0)
+    #
+    #                 pred_label.extend(out.argmax(dim=-1).tolist())
+    #
+    #                 # top_score, top_label = torch.topk(out, 2)
+    #
+    #         # H = np.mean(-np.log(H + 1e-12))
+    #
+    #         # print(np.mean([H[i] for i in range(len(true_label)) if true_label[i] == pred_label[i]]))
+    #         # print(np.mean([H[i] for i in range(len(true_label)) if true_label[i] != pred_label[i]]))
+    #
+    #         _correctly_predicted = []
+    #         _wrongly_predicted = []
+    #
+    #         for i in range(len(true_label)):
+    #             if true_label[i] == pred_label[i]:
+    #                 _correctly_predicted.append(H[i])
+    #             else:
+    #                 _wrongly_predicted.append(H[i])
+    #
+    #         correctly_predicted.append(_correctly_predicted)
+    #         wrongly_predicted.append(_wrongly_predicted)
+    #
+    #     # correctly_predicted, wrongly_predicted = np.asarray(correctly_predicted), np.asarray(wrongly_predicted)
+    #
+    #     return correctly_predicted, wrongly_predicted
+
+    def white_noise_test(self, samples=1):
+
+        ts_copy = deepcopy(self.test_data.dataset.transform)
+
+        correctly_predicted = []
+        wrongly_predicted = []
+
+        correctly_predicted_h = []
+        wrongly_predicted_h = []
+
+        self.model.eval()
+        with torch.no_grad():
+
+            for eps in tqdm(self.noise, desc='White noise test', leave=False):
+
+                ts = T.Compose([ts_copy, AddNoise(eps)])
+                self.test_data.dataset.transform = ts
+
+                H = []
+                He = []
+                pred_label = []
+                true_label = []
+
+                for i, (x, y) in enumerate(self.test_data):
+                    true_label.extend(y.tolist())
+
+                    x = x.to(self.device)
+
+                    out = self.model.eval_forward(x, samples=samples)
+
+                    a, _ = epistemic_aleatoric_uncertainty(out)
+                    H.extend(a)
+
+                    a, _ = entropy(out)
+                    He.extend(a)
+
+                    out = torch.softmax(out, -1)
+                    if out.dim() > 2:
+                        out = out.mean(0)
+
+                    pred_label.extend(out.argmax(dim=-1).tolist())
+
+                _correctly_predicted = []
+                _wrongly_predicted = []
+
+                for i in range(len(true_label)):
+                    if true_label[i] == pred_label[i]:
+                        _correctly_predicted.append(H[i])
+                    else:
+                        _wrongly_predicted.append(H[i])
+
+                correctly_predicted.append(_correctly_predicted)
+                wrongly_predicted.append(_wrongly_predicted)
+
+                _correctly_predicted = []
+                _wrongly_predicted = []
+
+                for i in range(len(true_label)):
+                    if true_label[i] == pred_label[i]:
+                        _correctly_predicted.append(He[i])
+                    else:
+                        _wrongly_predicted.append(He[i])
+
+                correctly_predicted_h.append(_correctly_predicted)
+                wrongly_predicted_h.append(_wrongly_predicted)
+        # correctly_predicted, wrongly_predicted = np.asarray(correctly_predicted), np.asarray(wrongly_predicted)
+
+        self.test_data.dataset.transform = ts_copy
+
+        return (correctly_predicted, wrongly_predicted), (correctly_predicted_h, wrongly_predicted_h)
 
     def reliability_diagram(self, samples=1, bins=15, scaling=1, **kwargs):
 
@@ -725,6 +906,9 @@ if __name__ == '__main__':
         mn = 1/classes**classes
         mx = mn * (2**(classes-1))
 
+        a = np.diag(p_hat)
+        input(p_hat)
+
         for _bi in range(p.shape[0]):
             _bp = p[_bi]
             _bp_hat = p_hat[_bi]
@@ -740,10 +924,10 @@ if __name__ == '__main__':
                 epistemic = np.outer(d, d)
                 ep += epistemic
 
+            print(al, ep)
             al /= t
             ep /= t
 
-            print(al+ep)
             variances.append(al+ep+(np.eye(classes) / classes))
 
             det = np.linalg.det(variances[-1])
@@ -756,10 +940,64 @@ if __name__ == '__main__':
 
         return determinants, variances
 
+    def prova_1(inp):
+        if inp.dim() == 2:
+            inp = inp.unsqueeze(0)
+
+        p = inp
+        p_hat = torch.mean(p, 0)
+
+        p = p.detach().cpu().numpy()
+        p = np.transpose(p, (1, 0, 2))
+
+        p_hat = p_hat.detach().cpu().numpy()
+
+        t = p.shape[1]
+        classes = p.shape[-1]
+
+        determinants = []
+        variances = []
+
+        mn = 1/classes**classes
+        mx = mn * (2**(classes-1))
+
+        for _bi in range(p.shape[0]):
+            _bp = p[_bi]
+            _bp_hat = p_hat[_bi]
+
+            entropy = -np.inner(_bp_hat, np.log(_bp_hat+1e-12))
+
+            # al = np.zeros((classes, classes))
+            # ep = np.zeros((classes, classes))
+            #
+            # for i in range(t):
+            #     _p = _bp[i]
+            #     aleatoric = np.diag(_p) - np.outer(_p, _p)
+            #     al += aleatoric
+            #     d = _p - _bp_hat
+            #     epistemic = np.outer(d, d)
+            #     ep += epistemic
+            #
+            # al /= t
+            # ep /= t
+            #
+            # variances.append(al+ep+(np.eye(classes) / classes))
+            #
+            # det = np.linalg.det(variances[-1])
+            #
+            # det = (det - mn) / (mx-mn)
+            # determinants.append(det)
+            determinants.append(entropy)
+
+        determinants = np.asarray(determinants)
+        variances = np.asarray(variances)
+
+        return determinants, variances
+
     x = torch.tensor(
         [
             [
-                [.25, .25, .25, .25],
+                [0.25, 0.25, 0.25, 0.25],
             ]
         ],
         dtype=torch.float
@@ -770,6 +1008,9 @@ if __name__ == '__main__':
     print(d)
 
     a, b = prova(x)
+    print(a)
+
+    a, b = prova_1(x)
     print(a)
 
     # a, _ = epistemic_aleatoric_uncertainty(x)

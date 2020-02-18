@@ -7,6 +7,17 @@ import ANN
 import DropoutNet
 from priors import Gaussian, Laplace, ScaledMixtureGaussian, Uniform
 
+font = {'font.family': 'serif',
+        'axes.labelsize': 11,
+        'font.size': 11,
+        'xtick.labelsize': 11,
+        'ytick.labelsize': 11,
+        'figure.figsize': [4, 3],
+        'text.usetex': True,
+        'font.serif': ['Times New Roman'] + plt.rcParams['font.serif']}
+
+plt.rcParams.update(font)
+
 
 class RegressionDataset(Dataset):
     def __init__(self, x, y):
@@ -23,10 +34,7 @@ class RegressionDataset(Dataset):
 
 def get_dataset(batch_size, regression_points, points_range, variance, noise):
     lengthscale = 1
-    # variance = 2
-    # sig_noise = 0.1
 
-    # x = np.random.uniform(points_range[0], points_range[1], regression_points)[:, None]
     dist = np.abs(points_range[0] - points_range[1]) // 2
 
     x = np.concatenate((
@@ -53,32 +61,6 @@ def get_dataset(batch_size, regression_points, points_range, variance, noise):
 
     test_dataset = RegressionDataset(x[test_idx],
                                      y[test_idx])
-    # lengthscale = 1
-    # # variance = 2
-    # # sig_noise = 0.1
-    #
-    # x = np.random.uniform(points_range[0]-2, points_range[0], regression_points//2)[:, None]
-    # x = np.concatenate((x, np.random.uniform(points_range[1], points_range[1]+2, regression_points//2)[:, None]))
-    # x.sort(axis=0)
-    #
-    # k = GPy.kern.RBF(input_dim=1, variance=variance, lengthscale=lengthscale)
-    # C = k.K(x, x) + np.eye(regression_points) * (x + 2) ** 2 * noise ** 2
-    #
-    # y = np.random.multivariate_normal(np.zeros(regression_points), C)[:, None]
-    # y = (y - y.mean())
-    # test_dataset = RegressionDataset(x, y)
-
-    # idx = np.arange(regression_points)
-    #
-    # np.random.shuffle(idx)
-    #
-    # split = int(len(idx) * 0.75)
-    #
-    # x_tr, x_te = x[idx[:split]], x[idx[split:]]
-    # y_tr, y_te = y[idx[:split]], y[idx[split:]]
-    #
-    # train_dataset = RegressionDataset(x_tr, y_tr)
-    # test_dataset = RegressionDataset(x_te, y_te)
 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
@@ -103,7 +85,7 @@ def main(experiment):
     Optimizers = ['sgd', 'adam', 'rmsprop']
     NetworkTypes = ['bbb', 'mmd', 'normal', 'dropout']
     Datasets = ['homo', 'hetero']
-    PosteriorType = ['layers', 'neurons', 'weights', 'multiplicative']
+    # PosteriorType = ['layers', 'neurons', 'weights', 'multiplicative']
     # LrScheduler = ['step', 'exponential', 'plateau']
     Priors = ['gaussian', 'laplace', 'uniform', 'scaledGaussian']
 
@@ -114,7 +96,7 @@ def main(experiment):
     # experiments = experiment['experiments']
 
     # print(cm.colors)
-    for data in experiments:
+    for data in experiment:
         print(data['save_path'], data['exp_name'])
 
         if data.get('skip', False):
@@ -146,18 +128,13 @@ def main(experiment):
         # label = data.get("label", network)
         network_parameters = data.get('network_parameters', {})
         posterior_type = data.get('posterior_type', 'weights')
-        moment = data.get('moment', 0)
-        early_stopping_tolerance = data.get('early_stopping_tolerance', 5)
-        resize = data.get('resize', None)
-        weight_decay = data.get('weight_decay', 0)
-        lr_scheduler = data.get('lr_scheduler', None)
 
         regression_points = data.get('regression_points', 100)
 
         variance = data['variance']
         noise = data['noise']
         points_range = data.get('range', [-10, 10])
-        batch_size = data.get('batch_size', regression_points//5)
+        batch_size = data.get('batch_size', 10)
 
         # PRIORS
 
@@ -237,6 +214,8 @@ def main(experiment):
             os.makedirs(save_path)
 
         for e, seed in enumerate(seeds):
+
+            seed = seed + int(noise*100)
             torch.manual_seed(seed)
             np.random.seed(seed)
 
@@ -269,7 +248,7 @@ def main(experiment):
 
             t = trainer(model, train_loader, test_loader, opt)
 
-            for i in progress_bar:
+            for _ in progress_bar:
                 loss, _, _ = t.train_step(train_samples=train_samples, test_samples=test_samples,
                                           weights=loss_weights)
                 progress_bar.set_postfix(loss=np.mean(loss))
@@ -291,56 +270,39 @@ def main(experiment):
                     y_pred, y_noise = pred[:, 0], pred[:, 1]
                 else:
                     y_pred, y_noise = pred[:, 0], np.asarray([t.model.noise.exp().item()] * len(x_true))
-            # print(pred)
-
-            # fig = plt.figure()
-
-            # for x, y in train_loader:
-            #     plt.scatter(x, y, c='r')
-
-            # x_true, y_true, y_pred, n = t.test_evaluation()
-            #
-            # if isinstance(n, float):
-            #     n = [[n]*len(x_true)]
-            #
-            # x_true = np.reshape(np.asarray(x_true), -1)#.mean(-1)
-            # sort_index = np.argsort(x_true)
-            #
-            # y_true = np.reshape(np.asarray(y_true), -1)#.mean(-1)
-            # y_pred = np.reshape(np.asarray(y_pred), -1)#.mean(-1)
-            # n = np.reshape(np.asarray(n), -1)**0.5 #.mean(-1)
-            #
-            # # n = (n ** 2).mean(axis=0) ** 0.5
-            #
-            # x_true = x_true[sort_index]
-            # y_true = y_true[sort_index]
-            # y_pred = y_pred[sort_index]
 
             mx = -np.inf
             mn = +np.inf
+
             for x, y in train_loader:
                 mn = min(y.min().item(), mn)
                 mx = max(y.max().item(), mx)
-                plt.scatter(x, y, c='b', marker='+', alpha=0.5, s=2)
+                plt.scatter(x, y, c='b', marker='+', alpha=0.5, s=1)
 
             for x, y in test_loader:
                 mn = min(y.min().item(), mn)
                 mx = max(y.max().item(), mx)
-                plt.scatter(x, y, c='r', marker='.')
-
-            print(mn, mx)
-            # plt.show()
-            # print(n)
+                plt.scatter(x, y, c='r', s=4)
 
             plt.fill_between(x_true, y_pred - y_noise, y_pred + y_noise, alpha=0.2)
             plt.fill_between(x_true, y_pred - 2 * y_noise, y_pred + 2 * y_noise, alpha=0.2)
             plt.fill_between(x_true, y_pred - 3 * y_noise, y_pred + 3 * y_noise, alpha=0.2)
 
-            plt.plot(x_true, y_pred)
+            plt.plot(x_true, y_pred, linewidth=0.8)
             offset = np.abs(mn - mx) * 0.1
+
+            print(mx, mn)
             plt.ylim(mn - offset, mx + offset)
-            plt.xticks(fontsize=15)
-            plt.yticks(fontsize=17)
+            plt.xlim(np.min(x_true), np.max(x_true))
+
+            plt.grid(True, alpha=0.2)
+
+            # plt.xticks(fontsize=15)
+            # plt.yticks(fontsize=17)
+
+            plt.xlabel('x')
+            plt.ylabel('y')
+
             plt.savefig(os.path.join(save_path, "{}_{}.pdf".format(e, network)), bbox_inches='tight')
             plt.close()
 

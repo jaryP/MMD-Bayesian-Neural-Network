@@ -14,12 +14,10 @@ class BayesianParameters(nn.Module):
 
         if mu_initialization is None:
             t = torch.empty(size)
-            # print(mu_initialization, is_bias, size)
             if is_bias:
                 bound = 1 / np.sqrt(size)
                 init.uniform_(t, -bound, bound)
             else:
-                # nn.init.kaiming_uniform_(t, mode='fan_in', nonlinearity='relu')
                 init.kaiming_uniform_(t, a=np.sqrt(5))
             self.mu = nn.Parameter(t, requires_grad=True)
 
@@ -99,7 +97,6 @@ class BayesianParameters(nn.Module):
             percentile = np.percentile(snr.cpu(), self.mask * 100)
             mask = torch.ones_like(snr)
             mask[snr < torch.tensor(percentile)] = 0
-
             r = r * mask
 
         return r
