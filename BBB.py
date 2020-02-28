@@ -1,26 +1,18 @@
-from itertools import chain
-
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.distributions import Normal
 import numpy as np
+import torch
+import torch.nn as nn
 from tqdm import tqdm
 
-from base import BayesianLinearLayer, Gaussian, Network, Wrapper
-import torch
+from base import Wrapper, get_bayesian_network, cross_entropy_loss, log_gaussian_loss, Network
+from priors import Gaussian
+from bayesian_layers import BayesianCNNLayer, BayesianLinearLayer
 
 
 class BBB(Network):
 
-    def __init__(self, input_size, classes, topology=None, prior=None, mu_init=None, rho_init=None,
-                 local_trick=False, **kwargs):
-        super().__init__()
-
-        if mu_init is None:
-            mu_init = (-0.6, 0.6)
-
-        if rho_init is None:
-            rho_init = -6
+    def __init__(self, sample, classes, topology=None, prior=None, mu_init=None, rho_init=None,
+                 local_trick=False, regression=False, posterior_type='weights', **kwargs):
+        super().__init__(classes=classes, regression=regression)
 
         if topology is None:
             topology = [400, 400]
@@ -28,36 +20,25 @@ class BBB(Network):
         if prior is None:
             prior = Gaussian(0, 10)
 
-        self.features = nn.ModuleList()
+        self.calculate_kl = True
+
         self._prior = prior
-
-        prev = input_size
-
-        for i in topology:
-            self.features.append(
-                BayesianLinearLayer(in_size=prev, out_size=i, mu_init=mu_init, divergence='kl',
-                                    rho_init=rho_init, prior=self._prior, local_rep_trick=local_trick))
-            prev = i
-
-        self.classificator = nn.ModuleList(
-            [BayesianLinearLayer(in_size=prev, out_size=classes, mu_init=mu_init, rho_init=rho_init, divergence='kl',
-                                 prior=self._prior, local_rep_trick=local_trick)])
+        self.features = get_bayesian_network(topology, sample, classes,
+                                             mu_init, rho_init, prior, 'kl', local_trick, bias=True,
+                                             posterior_type=posterior_type)
 
     def _forward(self, x):
 
         tot_prior = 0
         tot_post = 0
 
-        for i in self.features:
-            x, prior, post = i(x)
-            tot_post += post
-            tot_prior += prior
-            x = torch.relu(x)
-
-        for i in self.classificator:
-            x, prior, post = i(x)
-            tot_post += post
-            tot_prior += prior
+        for j, i in enumerate(self.features):
+            if not isinstance(i, (BayesianLinearLayer, BayesianCNNLayer)):
+                x = i(x)
+            else:
+                x, prior, post = i(x,  self.calculate_kl)
+                tot_post += post
+                tot_prior += prior
 
         return x, tot_prior, tot_post
 
@@ -80,17 +61,20 @@ class BBB(Network):
         log_post = log_posts.mean()
         return o, log_prior, log_post
 
-    def layers(self):
-        return chain(self.features, self.classificator)
-
     def eval_forward(self, x, samples=1):
         o, _, _ = self(x, samples=samples)
         return o
 
 
 class Trainer(Wrapper):
-    def __init__(self, model: nn.Module, train_data, test_data, optimizer):
+    def __init__(self, model: nn.Module, train_data, test_data, optimizer, **kwargs):
         super().__init__(model, train_data, test_data, optimizer)
+
+        self.regression = model.regression
+        if model.regression:
+            self.loss = log_gaussian_loss(model.classes)
+        else:
+            self.loss = cross_entropy_loss('sum')
 
     def train_epoch(self, samples=1, **kwargs):
         losses = []
@@ -102,150 +86,57 @@ class Trainer(Wrapper):
         pi = a / b
 
         self.model.train()
-        progress_bar = tqdm(enumerate(self.train_data), total=len(self.train_data), disable=True)
-        # progress_bar.set_postfix(mmd_loss='not calculated', ce_loss='not calculated')
+        progress_bar = tqdm(enumerate(self.train_data), total=len(self.train_data), disable=False, leave=False)
+        progress_bar.set_postfix(ce_loss='', kl_loss='')
 
         train_true = []
         train_pred = []
+        self.model.calculate_kl = True
 
-        for batch, (x_train, y_train) in progress_bar:
-            train_true.extend(y_train.tolist())
+        for batch, (x, y) in progress_bar:
+            train_true.extend(y.tolist())
+            y = y.to(self.device)
+            x = x.to(self.device)
 
             self.optimizer.zero_grad()
 
-            out, prior, post = self.model(x_train.to(self.device), samples=samples)
-            out = out.mean(0)
-            logloss = (- post - prior) * pi[batch]  # /x_train.shape[0]
+            out, prior, post = self.model(x, samples=samples)
 
-            ce = F.nll_loss(F.log_softmax(out, -1), y_train.to(self.device))
-            loss = ce + logloss
+            logloss = (post - prior) * pi[batch] #/ x.shape[0]
+
+            if pi[batch] == 0:
+                self.model.calculate_kl = False
+
+            if self.regression:
+                out = out.mean(0)
+                logloss = logloss/x.shape[0]
+
+                if self.model.classes == 1:
+                    noise = self.model.noise.exp()
+                    x = out
+                    loss = self.loss_function(x, y, noise)
+                else:
+                    loss = self.loss_function(out[:, :1], y, out[:, 1:].exp())
+                loss = loss/x.shape[0]
+            else:
+                loss = self.loss_function(out, y)
+                out = torch.softmax(out, -1).mean(0)
+                out = out.argmax(dim=-1)
+
+            progress_bar.set_postfix(ce_loss=loss.item(), kl_loss=logloss.item())
+            loss += logloss
+
             losses.append(loss.item())
             loss.backward()
 
             self.optimizer.step()
 
-            max_class = F.log_softmax(out, -1).argmax(dim=-1)
-            train_pred.extend(max_class.tolist())
-            # progress_bar.set_postfix(ce_loss=loss.item())
+            train_pred.extend(out.tolist())
 
         return losses, (train_true, train_pred)
-
-    def test_evaluation(self, samples, **kwargs):
-
-        test_pred = []
-        test_true = []
-
-        self.model.eval()
-        with torch.no_grad():
-            for i, (x_test, y_test) in enumerate(self.test_data):
-                test_true.extend(y_test.tolist())
-
-                out = self.model.eval_forward(x_test.to(self.device), samples=samples)
-                out = out.mean(0)
-                out = out.argmax(dim=-1)
-                test_pred.extend(out.tolist())
-
-        return test_true, test_pred
 
     def train_step(self, train_samples=1, test_samples=1, **kwargs):
         losses, train_res = self.train_epoch(samples=train_samples)
         test_res = self.test_evaluation(samples=test_samples)
         return losses, train_res, test_res
 
-    def snr_test(self, percentiles: list):
-        return None
-
-
-# def epoch(model, optimizer, train_dataset, test_dataset, train_samples, test_samples, device, weights, **kwargs):
-#     losses = []
-#
-#     # mmd_w = weights.get('mmd', 1)
-#
-#     M = len(train_dataset)
-#     a = np.asarray([2 ** (M - i - 1) for i in range(M + 1)])
-#     b = 2 ** M - 1
-#
-#     pi = a / b
-#
-#     model.train()
-#     progress_bar = tqdm(enumerate(train_dataset), total=len(train_dataset), disable=True)
-#     # progress_bar.set_postfix(mmd_loss='not calculated', ce_loss='not calculated')
-#
-#     train_true = []
-#     train_pred = []
-#
-#     for batch, (x_train, y_train) in progress_bar:
-#         train_true.extend(y_train.tolist())
-#
-#         optimizer.zero_grad()
-#
-#         out, prior, post = model.sample_forward(x_train.to(device), samples=train_samples)
-#         out = out.mean(0)
-#         logloss = (- post - prior) * pi[batch] # /x_train.shape[0]
-#         # mmd = (mmd * mmd_w)
-#
-#         max_class = F.log_softmax(out, -1).argmax(dim=-1)
-#         train_pred.extend(max_class.tolist())
-#
-#         ce = F.nll_loss(F.log_softmax(out, -1), y_train.to(device))
-#         loss = ce + logloss
-#         losses.append(loss.item())
-#         loss.backward()
-#         optimizer.step()
-#
-#         progress_bar.set_postfix(log_loss=logloss.item(), ce_loss=ce.item())
-#
-#     test_pred = []
-#     test_true = []
-#
-#     model.eval()
-#     with torch.no_grad():
-#         for i, (x_test, y_test) in enumerate(test_dataset):
-#             test_true.extend(y_test.tolist())
-#
-#             out, _, _ = model.sample_forward(x_test.to(device), samples=test_samples)
-#             out = out.mean(0)
-#             out = out.argmax(dim=-1)
-#             test_pred.extend(out.tolist())
-#
-#     return losses, (train_true, train_pred), (test_true, test_pred)
-
-
-if __name__ == '__main__':
-    from itertools import chain
-
-    import torch
-    from sklearn import metrics
-    from torch import nn
-    from torchvision.transforms import transforms
-    from torchvision import datasets
-    from tqdm import tqdm
-
-    image_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,)),
-        # transforms.Normalize((0,), (1,)),
-        torch.flatten
-    ])
-
-    train_split = datasets.MNIST('./Datasets/MNIST', train=True, download=True,
-                                 transform=image_transform)
-
-    train_loader = torch.utils.data.DataLoader(train_split, batch_size=100, shuffle=True)
-
-    test_loader = torch.utils.data.DataLoader(
-        datasets.MNIST('./Datasets/MNIST', train=False, transform=image_transform), batch_size=1000,
-        shuffle=False)
-
-    input_size = 784
-    classes = 10
-
-    ann = BBB(784, 10, local_trick=False)
-    ann.cuda()
-    trainer = Trainer(ann, train_loader, test_loader, torch.optim.Adam(ann.parameters(), 1e-3))
-
-    for i in range(10):
-       a, _, (test_true, test_pred) = trainer.train_step(test_samples=2, train_samples=2)
-       f1 = metrics.f1_score(test_true, test_pred, average='micro')
-
-       print(f1)

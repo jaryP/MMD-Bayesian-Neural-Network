@@ -1,75 +1,69 @@
-from itertools import chain
-
 import torch
-from sklearn import metrics
-from torch import nn
-from torchvision.transforms import transforms
-from torchvision import datasets
 from tqdm import tqdm
 
-from base import Network, Wrapper
-import torch.nn.functional as F
+from base import Wrapper, get_network, log_gaussian_loss, \
+    cross_entropy_loss, Network
 
 
 class ANN(Network):
-    def __init__(self, input_size, classes, topology=None, **kwargs):
-        super().__init__()
+    def __init__(self, sample, classes, topology=None, regression=False, **kwargs):
+        super().__init__(classes=classes, regression=regression)
 
         if topology is None:
             topology = [400, 400]
 
-        self.features = torch.nn.ModuleList()
-
-        prev = input_size
-
-        for i in topology:
-            self.features.append(
-                torch.nn.Linear(prev, i))
-            prev = i
-
-        self.classificator = nn.ModuleList([torch.nn.Linear(prev, classes)])
+        self.features = get_network(topology, sample, classes)
 
     def forward(self, x, **kwargs):
-
         for j, i in enumerate(self.features):
-            r = i(x)
-            x = torch.relu(r)
+            x = i(x)
 
-        x = self.classificator[0](x)
         return x
-
-    def layers(self):
-        return chain(self.features, self.classificator)
 
     def eval_forward(self, x, **kwargs):
         return self.forward(x)
 
 
 class Trainer(Wrapper):
-    def __init__(self, model: nn.Module, train_data, test_data, optimizer):
+    def __init__(self, model: ANN, train_data, test_data, optimizer, **kwargs):
         super().__init__(model, train_data, test_data, optimizer)
+
+        self.regression = model.regression
+        if model.regression:
+            self.loss = log_gaussian_loss(model.classes)
+        else:
+            self.loss = cross_entropy_loss('mean')
 
     def train_epoch(self, **kwargs):
         losses = []
 
         self.model.train()
-        progress_bar = tqdm(enumerate(self.train_data), total=len(self.train_data), disable=True)
-        # progress_bar.set_postfix(mmd_loss='not calculated', ce_loss='not calculated')
+        progress_bar = tqdm(enumerate(self.train_data), total=len(self.train_data), disable=False, leave=False)
 
         train_true = []
         train_pred = []
 
-        for batch, (x_train, y_train) in progress_bar:
-            train_true.extend(y_train.tolist())
+        for batch, (x, y) in progress_bar:
+            train_true.extend(y.tolist())
+            x = x.to(self.device)
+            y = y.to(self.device)
 
             self.optimizer.zero_grad()
 
-            out = self.model(x_train.to(self.device))
+            out = self.model(x)
 
-            max_class = F.log_softmax(out, -1).argmax(dim=-1)
-            train_pred.extend(max_class.tolist())
+            if self.regression:
+                if self.model.classes == 1:
+                    noise = self.model.noise.exp()
+                    x = out
+                    loss = self.loss_function(x, y, noise)
+                else:
+                    loss = self.loss_function(out[:, :1], y, out[:, 1:].exp())/x.shape[0]
+            else:
+                loss = self.loss_function(out, y)
+                out = out.argmax(dim=-1)
 
-            loss = F.nll_loss(F.log_softmax(out, -1), y_train.to(self.device))
+            train_pred.extend(out.tolist())
 
             losses.append(loss.item())
             loss.backward()
@@ -81,65 +75,31 @@ class Trainer(Wrapper):
 
     def test_evaluation(self, **kwargs):
 
-        test_pred = []
-        test_true = []
+        pred = []
+        x_all = []
+        y_all = []
+        noises = []
 
         self.model.eval()
         with torch.no_grad():
-            for i, (x_test, y_test) in enumerate(self.test_data):
-                test_true.extend(y_test.tolist())
+            for i, (x, y) in enumerate(self.test_data):
+                y_all.extend(y.tolist())
+                x_all.extend(x.tolist())
 
-                out = self.model(x_test.to(self.device))
-                out = out.argmax(dim=-1)
-                test_pred.extend(out.tolist())
+                out = self.model(x.to(self.device))
 
-        return test_true, test_pred
+                if not self.regression:
+                    out = out.argmax(dim=-1)
+                    pred.extend(out.tolist())
+                else:
+                    pred.extend(out[:, 0].tolist())
+                    if self.model.classes == 2:
+                        noises.extend(out[:, 1].exp().tolist())
 
-    def snr_test(self, percentiles: list):
-        return None
+        if not self.regression:
+            return y_all, pred
 
+        if len(noises) == 0:
+            noises = self.model.noise.exp().item()
 
-# def sample_forward(self, x, samples=1, task=None):
-#     o = []
-#     mmds = []
-#
-#     for i in range(samples):
-#         op, mmd = self(x, task=task)
-#         o.append(op)
-#         mmds.append(mmd)
-#
-#     o = torch.stack(o)
-#
-#     mmds = torch.stack(mmds).mean()
-#
-#     return o, mmds
-
-if __name__ == '__main__':
-    image_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,)),
-        # transforms.Normalize((0,), (1,)),
-        torch.flatten
-    ])
-
-    train_split = datasets.MNIST('./Datasets/MNIST', train=True, download=True,
-                                 transform=image_transform)
-
-    train_loader = torch.utils.data.DataLoader(train_split, batch_size=100, shuffle=True)
-
-    test_loader = torch.utils.data.DataLoader(
-        datasets.MNIST('./Datasets/MNIST', train=False, transform=image_transform), batch_size=1000,
-        shuffle=False)
-
-    input_size = 784
-    classes = 10
-
-    ann = ANN(784, 10)
-    ann.cuda()
-    trainer = Trainer(ann, train_loader, test_loader, torch.optim.Adam(ann.parameters(), 1e-3))
-
-    for i in range(10):
-       a, _, (test_true, test_pred) = trainer.train_step(cacca=20)
-       f1 = metrics.f1_score(test_true, test_pred, average='micro')
-
-       print(f1)
+        return x_all, y_all, pred, noises

@@ -1,304 +1,347 @@
 from abc import ABC, abstractmethod
-from typing import Tuple
+from copy import deepcopy
 
 import numpy as np
-
 import torch
-import torch.nn as nn
-from torch.distributions import Normal
-from tqdm import tqdm
 import torch.nn.functional as F
+import torchvision.transforms as T
+from sklearn import metrics
+from torch import nn, optim
+from tqdm import tqdm
+
+from bayesian_layers import BayesianCNNLayer, BayesianLinearLayer
+
+class percentageRotation:
+    def __init__(self, percentage):
+        self.percentage = percentage
+
+    def __call__(self, x):
+        return T.functional.rotate(x, self.percentage)
 
 
-def pairwise_distances(x, y):
-    x_norm = (x ** 2).sum(1).view(-1, 1)
-    y_norm = (y ** 2).sum(1).view(1, -1)
+class PixelShuffle:
+    def __init__(self, percentage):
+        if percentage < 0 or percentage > 1:
+            raise ValueError('percentage should be between 0 and 1, {} wasa given'.format(percentage))
 
-    dist = x_norm + y_norm - 2.0 * torch.mm(x, torch.transpose(y, 0, 1))
-    return torch.clamp(dist, 0.0, np.inf)
+        self.percentage = percentage
+        self.pixels_map = None
+
+    def shuffle_pixels(self, x):
+        x1 = x.copy()
+        if self.pixels_map is None:
+            w, h = x.size
+            pxs = []
+            for x in range(w):
+                for y in range(h):
+                    pxs.append((x, y))
+
+            ln = len(pxs)
+            idx = np.arange(ln)
+
+            pixels_map = \
+                zip(np.random.choice(idx, int(ln * self.percentage)), np.random.choice(idx, int(ln * self.percentage)))
+
+            self.pixels_map = [(pxs[i], x1.getpixel(pxs[j])) for i, j in pixels_map]
+
+        for a, b in self.pixels_map:
+            x1.putpixel(a, b)
+
+        return x1
+
+    def __call__(self, x):
+        x1 = self.shuffle_pixels(x)
+        return x1
 
 
-def compute_kernel(x, y):
-    dim = x.size(1)
-    # d = torch.exp(- torch.mul(torch.cdist(x, y).mean(1), 1/float(dim))).mean()
-    d = torch.exp(- torch.mul(pairwise_distances(x, y).mean(1), 1 / float(dim))).mean()
-    return d
+class AddNoise:
+    def __init__(self, noise):
+        self.noise = noise
+
+    def __call__(self, x):
+        return x + torch.randn(x.size()) * self.noise
 
 
-def compute_mmd(x, y):
-    x_kernel = compute_kernel(x, x)
-    y_kernel = compute_kernel(y, y)
-    xy_kernel = compute_kernel(x, y)
-    return x_kernel + y_kernel - 2 * xy_kernel
+# FGSM attack code
+def fgsm_attack(image, epsilon):
+    if epsilon == 0:
+        return image
+    # Collect the element-wise sign of the data gradient
+    sign_data_grad = image.grad.data.sign()
+    # Create the perturbed image by adjusting each pixel of the input image
+    perturbed_image = image + epsilon * sign_data_grad
+    # Adding clipping to maintain [0,1] range
+    perturbed_image = torch.clamp(perturbed_image, 0, 1)
+    # Return the perturbed image
+    return perturbed_image
 
 
-class BayesianParameters(nn.Module):
-    def __init__(self, size, mu_initialization=None, rho_initialization=None):
-        super().__init__()
+def log_gaussian_loss(out_dim):
+    def loss_function(x, y, sigma):
+        exponent = -0.5 * (x - y) ** 2 / sigma ** 2
+        log_coeff = -torch.log(sigma + 1e-12) - 0.5 * np.log(2 * np.pi)
+        return -(log_coeff + exponent).sum()
 
-        if mu_initialization is None:
-            self.mu = nn.Parameter(torch.randn(size))
-        elif isinstance(mu_initialization, (list, tuple)):
-            self.mu = nn.Parameter(torch.zeros(size).uniform_(*mu_initialization))
-        elif isinstance(mu_initialization, (float, int)):
-            self.mu = nn.Parameter(torch.ones(size) * mu_initialization)
+    return loss_function
+
+
+def cross_entropy_loss(reduction):
+    def loss_function(x, y):
+        _x = F.log_softmax(x, -1)
+        if _x.dim() == 3:
+            _x = _x.mean(0)
+        return F.nll_loss(_x, y, reduction=reduction)
+
+    return loss_function
+
+def det(x):
+    t = x.shape[1]
+    classes = x.shape[-1]
+
+    mn = 1 / classes ** classes
+    mx = mn * (2 ** (classes - 1))
+
+    det = np.linalg.det(x + (np.eye(classes) / classes))
+    det = (det - mn) / (mx - mn)
+
+    return det
+
+
+def epistemic_aleatoric_uncertainty(x):
+    if x.dim() == 2:
+        x = x.unsqueeze(0)
+
+    p = torch.softmax(x, 2)
+    p_hat = torch.mean(p, 0)
+
+    p = p.detach().cpu().numpy()
+    p = np.transpose(p, (1, 0, 2))
+
+    p_hat = p_hat.detach().cpu().numpy()
+
+    t = p.shape[1]
+    classes = p.shape[-1]
+
+    determinants = []
+    variances = []
+
+    mn = 1 / classes ** classes
+    mx = mn * (2 ** (classes - 1))
+
+    for _bi in range(p.shape[0]):
+        _bp = p[_bi]
+        _bp_hat = p_hat[_bi]
+
+        al = np.zeros((classes, classes))
+        ep = np.zeros((classes, classes))
+
+        for i in range(t):
+            _p = _bp[i]
+            aleatoric = np.diag(_p) - np.outer(_p, _p)
+            al += aleatoric
+            d = _p - _bp_hat
+            epistemic = np.outer(d, d)
+            ep += epistemic
+
+        al /= t
+        ep /= t
+
+        var = al + ep
+
+        variances.append(var)
+
+        det = np.linalg.det(var + (np.eye(classes) / classes))
+        det = (det - mn) / (mx - mn)
+
+        determinants.append(det)
+
+    determinants = np.asarray(determinants)
+    variances = np.asarray(variances)
+
+    return determinants, variances
+
+
+def entropy(x):
+    if x.dim() == 2:
+        x = x.unsqueeze(0)
+
+    p = torch.softmax(x, 2)
+    classes = p.shape[-1]
+
+    log_p = -torch.sum(p * torch.log(p + 1e-12), -1)/np.log(classes)
+    _entropy = torch.mean(log_p, 0)
+
+    return _entropy.tolist(), None
+
+
+def compute_entropy(preds, sum=True):
+    l = torch.log10(preds + 1e-12) * preds
+    if sum:
+        return -torch.sum(l, 1)
+    else:
+        return -l
+
+
+def get_bayesian_network(topology, input_image, classes, mu_init, rho_init, prior, divergence, local_trick,
+                         posterior_type, bias=True, **kwargs):
+    features = torch.nn.ModuleList()
+    prev = input_image.shape[0]
+    input_image = input_image.unsqueeze(0)
+    ll_conv = False
+
+    for j, i in enumerate(topology):
+
+        if isinstance(i, (tuple, list)) and i[0] == 'MP':
+            l = torch.nn.MaxPool2d(kernel_size=i[1], stride=i[2])
+            input_image = l(input_image)
+            prev = input_image.shape[1]
+            ll_conv = True
+
+        elif isinstance(i, str) and i.lower() == 'relu':
+            l = torch.nn.ReLU()
+
+        elif isinstance(i, str) and i.lower() == 'sigmoid':
+            l = torch.nn.Sigmoid()
+
+        elif isinstance(i, float):
+            l = torch.nn.Dropout(p=0.5)
+
+        elif isinstance(i, (tuple, list)) and i[0] == 'AP':
+            l = torch.nn.AvgPool2d(kernel_size=i[1], stride=i[2])
+            input_image = l(input_image)
+            prev = input_image.shape[1]
+            ll_conv = True
+
+        elif isinstance(i, (tuple, list)):
+            size, kernel_size, stride, padding = i
+
+            l = BayesianCNNLayer(in_channels=prev, kernels=size, kernel_size=kernel_size, posterior_type=posterior_type,
+                                 mu_init=mu_init, divergence=divergence, local_rep_trick=local_trick, stride=stride,
+                                 rho_init=rho_init, prior=prior, padding=padding, **kwargs)
+
+            input_image = l(input_image)[0]
+            prev = input_image.shape[1]
+
+        elif isinstance(i, int):
+            if ll_conv:
+                input_image = torch.flatten(input_image, 1)
+                prev = input_image.shape[-1]
+                features.append(Flatten())
+            ll_conv = False
+
+            size = i
+            l = BayesianLinearLayer(in_size=prev, out_size=size, mu_init=mu_init, divergence=divergence,
+                                    rho_init=rho_init, prior=prior, local_rep_trick=local_trick, use_bias=bias,
+                                    posterior_type=posterior_type, **kwargs)
+            prev = size
+
         else:
-            raise ValueError("Error mu")
+            raise ValueError('Topology should be tuple for cnn layers, formatted as (num_kernels, kernel_size), '
+                             'pooling layer, formatted as tuple ([\'MP\', \'AP\'], kernel_size, stride) '
+                             'or integer, for linear layer. {} was given'.format(i))
 
-        if rho_initialization is None:
-            self.rho = nn.Parameter(torch.randn(size))
-        elif isinstance(rho_initialization, (list, tuple)):
-            self.rho = nn.Parameter(torch.zeros(size).uniform_(*rho_initialization))
-        elif isinstance(rho_initialization, (float, int)):
-            self.rho = nn.Parameter(torch.ones(size) * rho_initialization)
+        features.append(l)
+
+    if isinstance(topology[-1], (tuple, list)):
+        input_image = torch.flatten(input_image, 1)
+        prev = input_image.shape[-1]
+        features.append(Flatten())
+
+    features.append(BayesianLinearLayer(in_size=prev, out_size=classes, mu_init=mu_init, rho_init=rho_init,
+                                        prior=prior, divergence=divergence, local_rep_trick=local_trick, use_bias=bias,
+                                        posterior_type=posterior_type, **kwargs))
+    return features
+
+
+def get_network(topology, input_image, classes, bias=True):
+    features = torch.nn.ModuleList()
+
+    prev = input_image.shape[0]
+    input_image = input_image.unsqueeze(0)
+    ll_conv = False
+
+    for j, i in enumerate(topology):
+
+        if isinstance(i, (tuple, list)) and i[0] == 'MP':
+            l = torch.nn.MaxPool2d(kernel_size=i[1], stride=i[2])
+            input_image = l(input_image)
+            prev = input_image.shape[1]
+            ll_conv = True
+
+        elif isinstance(i, str) and i.lower() == 'relu':
+            l = torch.nn.ReLU()
+
+        elif isinstance(i, float):
+            l = torch.nn.Dropout(p=0.5)
+
+        elif isinstance(i, (tuple, list)) and i[0] == 'AP':
+            l = torch.nn.AvgPool2d(kernel_size=i[1], stride=i[2])
+            input_image = l(input_image)
+            prev = input_image.shape[1]
+            ll_conv = True
+
+        elif isinstance(i, (tuple, list)):
+            size, kernel_size, stride, padding = i
+            l = torch.nn.Conv2d(in_channels=prev, out_channels=size, stride=stride,
+                                kernel_size=kernel_size, bias=False, padding=padding)
+
+            input_image = l(input_image)
+            prev = input_image.shape[1]
+            ll_conv = True
+
+        elif isinstance(i, int):
+            if ll_conv:
+                input_image = torch.flatten(input_image, 1)
+                prev = input_image.shape[-1]
+                features.append(Flatten())
+
+            ll_conv = False
+            size = i
+            l = torch.nn.Linear(prev, i, bias=bias)
+            prev = size
         else:
-            raise ValueError("Error rho")
+            raise ValueError('Topology should be tuple for cnn layers, formatted as (num_kernels, kernel_size), '
+                             'pooling layer, formatted as tuple ([\'MP\', \'AP\'], kernel_size, stride) '
+                             'or integer, for linear layer. {} was given'.format(i))
 
-    @property
-    def weights(self):
-        return self.mu + torch.log(1 + torch.exp(self.rho)) * torch.randn(self.mu.shape, requires_grad=True).to(
-            self.mu.device)  # Normal(0, 1).sample(self.mu.shape).to(self.mu.device)
+        features.append(l)
 
-    @property
-    def sigma(self):
-        return torch.log(1 + torch.exp(self.rho))
+    if ll_conv:
+        input_image = torch.flatten(input_image, 1)
+        prev = input_image.shape[-1]
+        features.append(Flatten())
 
-    def prior(self, prior: torch.distributions, w, log=True):
-        if log:
-            return prior.log_prob(w)
-        else:
-            return prior.prob(w)
+    features.append(torch.nn.Linear(prev, classes))
 
-    def posterior_distribution(self):
-        return Normal(self.mu.data.clone(), torch.log(1 + torch.exp(self.rho)).clone())
-
-    def posterior_log_prob(self, w):
-        return self.posterior_distribution().log_prob(w)
-
-    def forward(self, input, sample=1):
-        pass
+    return features
 
 
-class BayesianLinearLayer(nn.Module):
-    def __init__(self, in_size, out_size, divergence, mu_init=None, rho_init=None, use_bias=True, prior=None,
-                 local_rep_trick=False):
-
-        super().__init__()
-
-        divergence = divergence.lower()
-        if divergence not in ['mmd', 'kl']:
-            raise ValueError('type parameter should be mmd or bbb.')
-
-        self.local_trick = local_rep_trick
-
-        self.divergence = divergence
-
-        self.w = BayesianParameters(size=(out_size, in_size),
-                                    mu_initialization=mu_init, rho_initialization=rho_init)
-
-        self.b = None
-        if use_bias:
-            self.b = BayesianParameters(size=out_size,
-                                        mu_initialization=mu_init, rho_initialization=rho_init)
-
-        self.w_w = None
-        self.b_w = None
-
-        self.prior_w = prior
-        self.prior_b = prior
-        self.log_prior = None
-        self.log_posterior = None
-
-    def _forward(self, x):
-        b = None
-        if not self.local_trick:
-            w = self.w.weights
-            if self.b is not None:
-                b = self.b.weights
-            o = F.linear(x, w, b)
-            return o, w, b
-        else:
-            sigma_w = self.w.sigma
-            w_mu = torch.mm(x, self.w.mu.t())
-            w_std = torch.sqrt(torch.mm(x.pow(2), sigma_w.pow(2).t()))
-
-            w_out = w_mu + w_std * torch.randn(w_mu.shape, requires_grad=True).to(x.device)
-
-            if self.b is not None:
-                b = self.b.weights
-                w_out += b.unsqueeze(0).expand(x.shape[0], -1)
-                # torch.randn(w_mu.shape, requires_grad=True).to(self.mu.device)
-
-            return w_out, self.w.weights, b
-
-    def _mmd_forward(self, x):
-        o, w, b = self._forward(x)
-
-        mmd_w = torch.tensor(0.0)  # .float()
-        mmd_b = torch.tensor(0.0)  # .float()
-
-        if self.training:
-            mmd_w = compute_mmd(w, self.prior_w.sample(w.size()).to(w.device))
-
-            if b is not None:
-                b = b.unsqueeze(0)
-                mmd_b = compute_mmd(b, self.prior_b.sample(b.size()).to(b.device))
-
-        # o = F.linear(x, w, b)
-        #
-        # self.w_w = w
-        # self.b_w = b
-
-        return o, mmd_w + mmd_b
-
-    def _kl_forward(self, x):
-        # w = self.w.weights
-        o, w, b = self._forward(x)
-        log_post = torch.tensor(0.0)
-        log_prior = torch.tensor(0.0)
-
-        if self.training:
-            log_post = self.w.posterior_log_prob(w).sum()
-            log_prior = self.prior_w.log_prob(w).sum()
-            # b = None
-
-            if b is not None:
-                log_post += self.b.posterior_log_prob(b).sum()
-                log_prior += self.prior_b.log_prob(b).sum()
-
-        # o = F.linear(x, w, b)
-        #
-        # self.log_prior = log_prior
-        # self.log_posterior = log_post
-        # self.w_w = w
-        # self.b_w = b
-
-        return o, log_prior, log_post
-
-    # def _mmd_forward(self, x):
-    #     w = self.w.weights
-    #
-    #     b = None
-    #     mmd_w = torch.tensor(0).float()
-    #     mmd_b = torch.tensor(0).float()
-    #
-    #     if self.training:
-    #         mmd_w = compute_mmd(w, self.prior_w.sample(w.size()).to(w.device))
-    #
-    #         if self.b is not None:
-    #             b = self.b.weights.unsqueeze(0)
-    #             mmd_b = compute_mmd(b, self.prior_b.sample(b.size()).to(b.device))
-    #
-    #     o = F.linear(x, w, b)
-    #
-    #     self.w_w = w
-    #     self.b_w = b
-    #
-    #     return o, mmd_w + mmd_b
-
-    # def _kl_forward(self, x):
-    #     w = self.w.weights
-    #     log_post = self.w.posterior_log_prob(w).sum()
-    #     log_prior = self.prior_w.log_prob(w).sum()
-    #     b = None
-    #
-    #     if self.b is not None:
-    #         b = self.b.weights
-    #
-    #         log_post += self.b.posterior_log_prob(b).sum()
-    #         log_prior += self.prior_b.log_prob(b).sum()
-    #
-    #     o = F.linear(x, w, b)
-    #
-    #     self.log_prior = log_prior
-    #     self.log_posterior = log_post
-    #     self.w_w = w
-    #     self.b_w = b
-    #
-    #     return o, log_prior, log_post
-
-    @property
-    def weights(self):
-        return self.w_w, self.b_w
-
-    def set_prior(self, w=None, b=None):
-        if w is not None:
-            self.prior_w = w
-        if b is not None:
-            self.prior_b = b
-
-    def posterior(self):
-        return self.w.posterior_distribution(), self.b.posterior_distribution()
-
-    def posterior_distribution(self):
-        return self.w.posterior_distribution(), self.b.posterior_distribution()
-
+class Flatten(nn.Module):
     def forward(self, x):
-        if self.divergence == 'kl':
-            return self._kl_forward(x)
-        if self.divergence == 'mmd':
-            return self._mmd_forward(x)
-
-
-# PRIORS
-class Gaussian(object):
-    def __init__(self, mu=0, sigma=5):
-        self.mu = mu
-        self.sigma = sigma
-        self.inner_gaussian = Normal(mu, sigma)
-        # self.gaussian = torch.distributions.Normal(mu, sigma)
-
-    def sample(self, size):
-        return self.inner_gaussian.rsample(size)
-        # return self.mu + self.sigma * Normal(0, 1).sample(size)
-
-    def log_prob(self, x):
-        return self.inner_gaussian.log_prob(x)
-
-    def prob(self, x):
-        return self.inner_gaussian.prob(x)
-
-
-class ScaledMixtureGaussian(object):
-    def __init__(self, pi, s1, s2, mu1=0, mu2=0):
-        self.pi = pi
-        self.s1 = s1
-        self.s2 = s2
-        self.mu1 = mu1
-        self.mu2 = mu2
-        self.gaussian1 = Gaussian(mu1, s1)
-        self.gaussian2 = Gaussian(mu2, s2)
-
-    def sample(self, size):
-        return self.pi * self.gaussian1.sample(size) + (1 - self.pi) * self.gaussian2.sample(size)
-
-    def log_prob(self, x):
-        return self.pi * self.gaussian1.log_prob(x) + (1 - self.pi) * self.gaussian2.log_prob(x)
-
-    def prob(self, x):
-        return self.pi * self.gaussian1.prob(x) + (1 - self.pi) * self.gaussian2.prob(x)
+        x = x.view(x.size()[0], -1)
+        return x
 
 
 # Utils
 
-class Network(nn.Module, ABC):
-
-    @abstractmethod
-    def layers(self):
-        pass
-
-    @abstractmethod
-    def eval_forward(self, x, **kwargs):
-        pass
-
-
 class Wrapper(ABC):
-    def __init__(self, model: nn.Module, train_data, test_data, optimizer):
+    epsilons = [0, .001, .005, .01, .05, .1, .2, .3]
+    shuffle_percentage = [0, .1, .2, .5, .8]
+    noise = [0, 0.01, 0.05, 0.1, .2, .3, .4, .5, .6, .7, .8]
+
+    def __init__(self, model: nn.Module, train_data, test_data, optimizer, **kwargs):
         self.model = model
         self.train_data = train_data
         self.test_data = test_data
         self.optimizer = optimizer
         self.device = next(model.parameters()).device
+
+        self.regression = model.regression
+
+        if model.regression:
+            self.loss_function = log_gaussian_loss(model.classes)
+        else:
+            self.loss_function = cross_entropy_loss('mean')
 
     def train_step(self, **kwargs):
         losses, train_res = self.train_epoch(**kwargs)
@@ -306,56 +349,364 @@ class Wrapper(ABC):
         return losses, train_res, test_res
 
     @abstractmethod
-    def train_epoch(self, **kwargs) -> Tuple[list, Tuple[list, list]]:
+    def train_epoch(self, **kwargs):
         pass
+
+    def test_evaluation(self, samples, temperature=1, **kwargs):
+
+        test_pred = []
+        test_true = []
+
+        self.model.eval()
+        with torch.no_grad():
+            for i, (x, y) in tqdm(enumerate(self.test_data), leave=False, total=len(self.test_data)):
+                x = x.to(self.device)
+                y = y.to(self.device)
+
+                test_true.extend(y.tolist())
+
+                out = self.model.eval_forward(x.to(self.device), samples=samples)
+                out = torch.mul(out, temperature)
+
+                out = torch.softmax(out, -1)
+
+                if out.dim() > 2:
+                    out = out.mean(0)
+
+                out = out.argmax(dim=-1)
+                test_pred.extend(out.tolist())
+
+        return test_true, test_pred
+
+    def shuffle_test(self, samples=1):
+
+        ts_copy = deepcopy(self.test_data.dataset.transform)
+
+        HS = []
+        DIFF = []
+        scores = []
+        self.model.eval()
+
+        for n in tqdm(self.noise, desc='Pixel Shuffle test'):
+            ts = T.Compose([PixelShuffle(n), ts_copy])
+            self.test_data.dataset.transform = ts
+
+            H = []
+            pred_label = []
+            true_label = []
+            diff = []
+
+            self.model.eval()
+            with torch.no_grad():
+                for i, (x, y) in enumerate(self.test_data):
+                    true_label.extend(y.tolist())
+
+                    out = self.model.eval_forward(x.to(self.device), samples=samples)
+
+                    a, _ = epistemic_aleatoric_uncertainty(out)
+                    H.extend(a)
+
+                    if out.dim() > 2:
+                        out = out.mean(0)
+
+                    out = torch.softmax(out, -1)
+                    pred_label.extend(out.argmax(dim=-1).tolist())
+
+                    top_score, top_label = torch.topk(out, 2)
+
+                    diff.extend(((top_score[:, 0] - top_score[:, 1]) ** 2).tolist())
+
+            H = -np.log(np.mean(H))
+
+            HS.append(H)
+
+            scores.append(metrics.f1_score(true_label, pred_label, average='micro'))
+
+        self.test_data.dataset.transform = ts_copy
+        return HS, DIFF, scores
+
+    def fgsm_test(self, samples=1):
+
+        correctly_predicted = []
+        wrongly_predicted = []
+
+        correctly_predicted_h = []
+        wrongly_predicted_h = []
+
+        self.model.eval()
+        loss = cross_entropy_loss('mean')
+
+        for eps in tqdm(self.epsilons, desc='Attack test', leave=False):
+
+            H = []
+            He = []
+            pred_label = []
+            true_label = []
+
+            self.model.eval()
+            for i, (x, y) in enumerate(self.test_data):
+                true_label.extend(y.tolist())
+
+                x = x.to(self.device)
+                y = y.to(self.device)
+
+                self.model.zero_grad()
+                x.requires_grad = True
+
+                out = self.model.eval_forward(x.to(self.device), samples=1)
+                ce = loss(out, y)
+                ce.backward()
+
+                with torch.no_grad():
+                    perturbed_data = fgsm_attack(x, eps)
+
+                    out = self.model.eval_forward(perturbed_data, samples=samples)
+
+                    a, _ = epistemic_aleatoric_uncertainty(out)
+                    H.extend(a)
+
+                    a, _ = entropy(out)
+                    He.extend(a)
+
+                    out = torch.softmax(out, -1)
+                    if out.dim() > 2:
+                        out = out.mean(0)
+
+                    pred_label.extend(out.argmax(dim=-1).tolist())
+
+            _correctly_predicted = []
+            _wrongly_predicted = []
+
+            for i in range(len(true_label)):
+                if true_label[i] == pred_label[i]:
+                    _correctly_predicted.append(H[i])
+                else:
+                    _wrongly_predicted.append(H[i])
+
+            correctly_predicted.append(_correctly_predicted)
+            wrongly_predicted.append(_wrongly_predicted)
+
+            _correctly_predicted = []
+            _wrongly_predicted = []
+
+            for i in range(len(true_label)):
+                if true_label[i] == pred_label[i]:
+                    _correctly_predicted.append(He[i])
+                else:
+                    _wrongly_predicted.append(He[i])
+
+            correctly_predicted_h.append(_correctly_predicted)
+            wrongly_predicted_h.append(_wrongly_predicted)
+
+        return (correctly_predicted, wrongly_predicted), (correctly_predicted_h, wrongly_predicted_h)
+
+    def white_noise_test(self, samples=1):
+
+        ts_copy = deepcopy(self.test_data.dataset.transform)
+
+        correctly_predicted = []
+        wrongly_predicted = []
+
+        correctly_predicted_h = []
+        wrongly_predicted_h = []
+
+        self.model.eval()
+        with torch.no_grad():
+
+            for eps in tqdm(self.noise, desc='White noise test', leave=False):
+
+                ts = T.Compose([ts_copy, AddNoise(eps)])
+                self.test_data.dataset.transform = ts
+
+                H = []
+                He = []
+                pred_label = []
+                true_label = []
+
+                for i, (x, y) in enumerate(self.test_data):
+                    true_label.extend(y.tolist())
+
+                    x = x.to(self.device)
+
+                    out = self.model.eval_forward(x, samples=samples)
+
+                    a, _ = epistemic_aleatoric_uncertainty(out)
+                    H.extend(a)
+
+                    a, _ = entropy(out)
+                    He.extend(a)
+
+                    out = torch.softmax(out, -1)
+                    if out.dim() > 2:
+                        out = out.mean(0)
+
+                    pred_label.extend(out.argmax(dim=-1).tolist())
+
+                _correctly_predicted = []
+                _wrongly_predicted = []
+
+                for i in range(len(true_label)):
+                    if true_label[i] == pred_label[i]:
+                        _correctly_predicted.append(H[i])
+                    else:
+                        _wrongly_predicted.append(H[i])
+
+                correctly_predicted.append(_correctly_predicted)
+                wrongly_predicted.append(_wrongly_predicted)
+
+                _correctly_predicted = []
+                _wrongly_predicted = []
+
+                for i in range(len(true_label)):
+                    if true_label[i] == pred_label[i]:
+                        _correctly_predicted.append(He[i])
+                    else:
+                        _wrongly_predicted.append(He[i])
+
+                correctly_predicted_h.append(_correctly_predicted)
+                wrongly_predicted_h.append(_wrongly_predicted)
+
+        self.test_data.dataset.transform = ts_copy
+
+        return (correctly_predicted, wrongly_predicted), (correctly_predicted_h, wrongly_predicted_h)
+
+    def reliability_diagram(self, samples=1, bins=15, scaling=1, **kwargs):
+
+        y_prob = []
+        y_true = []
+        y_pred = []
+
+        self.model.eval()
+        with torch.no_grad():
+            for i, (x, y) in enumerate(self.test_data):
+                y_true.extend(y.tolist())
+                x = x.to(self.device)
+
+                out = self.model.eval_forward(x.to(self.device), samples=samples)
+
+                if hasattr(out, '__call__') and hasattr(out, 'sample'):
+                    scaling = out.sample(out.size()[-1])
+
+                if out.dim() > 2:
+                    out = out.mean(0)
+
+                out = torch.softmax(out, -1)
+                out = torch.div(out, scaling)
+
+                prob, pred = torch.topk(out, 1, -1)
+                y_prob.extend(prob.tolist())
+                y_pred.extend(pred.tolist())
+
+        y_true = np.asarray(y_true)[:, None]
+        y_prob = np.asarray(y_prob)
+        y_pred = np.asarray(y_pred)
+
+        prob_pred = np.empty((0,))
+        prob_true = np.zeros((0,))
+        ece = 0
+        nll = -np.sum(np.log(y_prob))
+
+        mce = []
+
+        for b in range(1, int(bins) + 1):
+            i = np.logical_and(y_prob <= b / bins, y_prob > (b - 1) / bins)  # indexes for p in the current bin
+
+            s = np.sum(i)
+
+            if s == 0:
+                prob_pred = np.hstack((prob_pred, 0))
+                prob_true = np.hstack((prob_true, 0))
+                continue
+
+            m = 1 / s
+            acc = m * np.sum(y_pred[i] == y_true[i])
+            conf = np.mean(y_prob[i])
+
+            prob_pred = np.hstack((prob_pred, conf))
+            prob_true = np.hstack((prob_true, acc))
+
+            mce.append(np.abs(acc - conf))
+
+            ece += (s / len(y_true)) * np.abs(acc - conf)
+
+        return prob_pred, prob_true, ece, nll
+
+    def total_variance(self, samples=1, **kwargs):
+
+        M = []
+
+        self.model.eval()
+        with torch.no_grad():
+            for i, (x, y) in enumerate(self.test_data):
+                x = x.to(self.device)
+                out = self.model.eval_forward(x, samples=samples)
+
+                _, m = epistemic_aleatoric_uncertainty(out)
+
+                M.extend(m)
+
+        M = np.asarray(M)
+        M = M.mean(0)
+
+        return M
+
+    def temperature_scaling(self, samples=1, **kwargs):
+        #  Based on https://github.com/gpleiss/temperature_scaling/
+        temperature = nn.Parameter(torch.ones(1, device=self.device) * 1, requires_grad=True)
+
+        optimizer = optim.Adam([temperature], lr=0.1)
+
+        outs = torch.tensor([], dtype=torch.long, requires_grad=False)
+
+        best_ece = self.reliability_diagram(samples=1)[-2]
+
+        for i, (x, y) in enumerate(self.test_data):
+            optimizer.zero_grad()
+
+            out = self.model.eval_forward(x.to(self.device), samples=1)
+
+            if out.dim() > 2:
+                out = out.mean(0)
+
+            out = torch.softmax(out, -1)
+            _, pred = torch.topk(out, 1, -1)
+
+            outs = torch.cat((outs, pred.cpu()))
+
+        for i in range(100):
+
+            optimizer.zero_grad()
+            _outs = torch.div(outs.to(self.device), temperature)
+
+            loss = torch.sum(torch.log(_outs + 1e-12))
+            loss.backward()
+            optimizer.step()
+
+            _, _, ece, _ = self.reliability_diagram(samples=samples, scaling=temperature.item())
+
+            if ece < best_ece:
+                best_ece = ece
+            else:
+                break
+
+        return best_ece
+
+
+class Network(nn.Module, ABC):
+    def __init__(self, classes, regression=False):
+        super().__init__()
+        self.classes = classes
+        self.regression = regression
+        self.features = []
+
+        if regression:
+            self.noise = nn.Parameter(torch.tensor(0.0))
 
     @abstractmethod
-    def test_evaluation(self, **kwargs) -> Tuple[list, list]:
+    def eval_forward(self, x, **kwargs):
         pass
 
-    @abstractmethod
-    def snr_test(self, percentiles: list) -> list:
-        pass
-
-
-def epoch(model, optimizer, train_dataset, test_dataset, device, **kwargs):
-    losses = []
-
-    model.train()
-    progress_bar = tqdm(enumerate(train_dataset), total=len(train_dataset), disable=True)
-    # progress_bar.set_postfix(mmd_loss='not calculated', ce_loss='not calculated')
-
-    train_true = []
-    train_pred = []
-
-    for batch, (x_train, y_train) in progress_bar:
-        train_true.extend(y_train.tolist())
-
-        optimizer.zero_grad()
-
-        out = model(x_train.to(device))
-
-        max_class = F.log_softmax(out, -1).argmax(dim=-1)
-        train_pred.extend(max_class.tolist())
-
-        loss = F.nll_loss(F.log_softmax(out, -1), y_train.to(device))
-
-        losses.append(loss.item())
-        loss.backward()
-        optimizer.step()
-
-        progress_bar.set_postfix(ce_loss=loss.item())
-
-    test_pred = []
-    test_true = []
-
-    model.eval()
-    with torch.no_grad():
-        for i, (x_test, y_test) in enumerate(test_dataset):
-            test_true.extend(y_test.tolist())
-
-            out = model(x_test.to(device))
-            out = out.argmax(dim=-1)
-            test_pred.extend(out.tolist())
-
-    return losses, (train_true, train_pred), (test_true, test_pred)
+    def set_mask(self, p):
+        for i in self.features:
+            if isinstance(i, (BayesianLinearLayer, BayesianCNNLayer)):
+                i.set_mask(p)
