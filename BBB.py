@@ -1,11 +1,9 @@
-from itertools import chain
-
 import numpy as np
 import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from base import Network, Wrapper, get_bayesian_network, cross_entropy_loss, log_gaussian_loss
+from base import Wrapper, get_bayesian_network, cross_entropy_loss, log_gaussian_loss, Network
 from priors import Gaussian
 from bayesian_layers import BayesianCNNLayer, BayesianLinearLayer
 
@@ -69,7 +67,7 @@ class BBB(Network):
 
 
 class Trainer(Wrapper):
-    def __init__(self, model: nn.Module, train_data, test_data, optimizer):
+    def __init__(self, model: nn.Module, train_data, test_data, optimizer, **kwargs):
         super().__init__(model, train_data, test_data, optimizer)
 
         self.regression = model.regression
@@ -136,23 +134,6 @@ class Trainer(Wrapper):
             train_pred.extend(out.tolist())
 
         return losses, (train_true, train_pred)
-
-    # def test_evaluation(self, samples, **kwargs):
-    #
-    #     test_pred = []
-    #     test_true = []
-    #
-    #     self.model.eval()
-    #     with torch.no_grad():
-    #         for i, (x, y) in enumerate(self.test_data):
-    #             test_true.extend(y.tolist())
-    #
-    #             out = self.model.eval_forward(x.to(self.device), samples=samples)
-    #             out = torch.softmax(out, -1).mean(0)
-    #             out = out.argmax(dim=-1)
-    #             test_pred.extend(out.tolist())
-    #
-    #     return test_true, test_pred
 
     def train_step(self, train_samples=1, test_samples=1, **kwargs):
         losses, train_res = self.train_epoch(samples=train_samples)

@@ -1,21 +1,15 @@
 from abc import ABC, abstractmethod
-from copy import copy, deepcopy
-from itertools import permutations
+from copy import deepcopy
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as T
-from scipy.optimize import minimize
 from sklearn import metrics
-from sklearn.metrics import confusion_matrix
-from torch import optim
-from torch.distributions import Exponential
+from torch import nn, optim
 from tqdm import tqdm
 
 from bayesian_layers import BayesianCNNLayer, BayesianLinearLayer
-
 
 class percentageRotation:
     def __init__(self, percentage):
@@ -57,14 +51,6 @@ class PixelShuffle:
 
     def __call__(self, x):
         x1 = self.shuffle_pixels(x)
-
-        # if self.percentage > 0:
-        #     import matplotlib.pyplot as plt
-        #     plt.subplot(1, 1, 1)
-        #     # plt.imshow(x, interpolation='none')
-        #     # plt.subplot(2, 1, 2)
-        #     plt.imshow((np.asarray(x1)-np.asarray(x))/np.max(np.asarray(x1)-np.asarray(x)), interpolation='none')
-        #     plt.show()
         return x1
 
 
@@ -107,38 +93,6 @@ def cross_entropy_loss(reduction):
         return F.nll_loss(_x, y, reduction=reduction)
 
     return loss_function
-
-
-# def epistemic_aleatoric_variance(x):
-#
-#     if x.dim() == 2:
-#         x = x.unsqueeze(0)
-#
-#     p = torch.softmax(x, -1)
-#     p_hat = torch.mean(p, 0)
-#     p = p.detach().cpu().numpy()
-#     p_hat = p_hat.detach().cpu().numpy()
-#
-#     t = p.shape[0]
-#     classes = p.shape[-1]
-#
-#     vars = []
-#
-#     for _p, _p_hat in zip(p, p_hat):
-#         aleatoric = np.zeros((classes, classes))
-#         epistemic = np.zeros((classes, classes))
-#
-#         for ip, ip_hat in zip(_p, _p_hat):
-#             aleatoric += np.diag(ip) - np.outer(ip, ip)
-#             d = ip - ip_hat
-#             epistemic += np.outer(d, d)
-#
-#         aleatoric /= t
-#         epistemic /= t
-#
-#         vars.append((aleatoric, epistemic))
-#
-#     return np.asarray(vars)
 
 def det(x):
     t = x.shape[1]
@@ -217,13 +171,6 @@ def entropy(x):
     log_p = -torch.sum(p * torch.log(p + 1e-12), -1)/np.log(classes)
     _entropy = torch.mean(log_p, 0)
 
-    # p = p.detach().cpu().numpy()
-
-    # classes = p.shape[-1]
-
-    # log_p = -np.sum(p * np.log(p + 1e-12), -1)/np.log(classes)
-    # _entropy = np.sum(log_p, 0)
-
     return _entropy.tolist(), None
 
 
@@ -238,8 +185,6 @@ def compute_entropy(preds, sum=True):
 def get_bayesian_network(topology, input_image, classes, mu_init, rho_init, prior, divergence, local_trick,
                          posterior_type, bias=True, **kwargs):
     features = torch.nn.ModuleList()
-    # self._prior = prior
-    # print(mu_init)
     prev = input_image.shape[0]
     input_image = input_image.unsqueeze(0)
     ll_conv = False
@@ -247,8 +192,6 @@ def get_bayesian_network(topology, input_image, classes, mu_init, rho_init, prio
     for j, i in enumerate(topology):
 
         if isinstance(i, (tuple, list)) and i[0] == 'MP':
-            # size, kernel_size, stride = i
-
             l = torch.nn.MaxPool2d(kernel_size=i[1], stride=i[2])
             input_image = l(input_image)
             prev = input_image.shape[1]
@@ -357,8 +300,6 @@ def get_network(topology, input_image, classes, bias=True):
             l = torch.nn.Linear(prev, i, bias=bias)
             prev = size
         else:
-            # 'Supported type for topology: \n' \
-            # 'List: []'
             raise ValueError('Topology should be tuple for cnn layers, formatted as (num_kernels, kernel_size), '
                              'pooling layer, formatted as tuple ([\'MP\', \'AP\'], kernel_size, stride) '
                              'or integer, for linear layer. {} was given'.format(i))
@@ -383,35 +324,12 @@ class Flatten(nn.Module):
 
 # Utils
 
-
-class Network(nn.Module, ABC):
-    def __init__(self, classes, regression=False):
-        super().__init__()
-        self.classes = classes
-        self.regression = regression
-        self.features = []
-
-        if regression:
-            self.noise = nn.Parameter(torch.tensor(0.0))
-
-    @abstractmethod
-    def eval_forward(self, x, **kwargs):
-        pass
-
-    def set_mask(self, p):
-        for i in self.features:
-            if isinstance(i, (BayesianLinearLayer, BayesianCNNLayer)):
-                i.set_mask(p)
-
-
 class Wrapper(ABC):
-    epsilons = [0, .001, .005, .01, .05, .1, .2, .3]  # , 0.005, 0.01, 0.05]  # , .2, .5]
-    # epsilons = [0, 0.01, 0.005, 0.1]  # , 0.005, 0.01, 0.05]  # , .2, .5]
+    epsilons = [0, .001, .005, .01, .05, .1, .2, .3]
     shuffle_percentage = [0, .1, .2, .5, .8]
-    noise = [0, 0.01, 0.05, 0.1, .2, .3, .4, .5, .6, .7, .8]  # , 0.005, 0.01, 0.05]  # , .2, .5]
-    # noise = [0, .5]  # , 0.005, 0.01, 0.05]  # , .2, .5]
+    noise = [0, 0.01, 0.05, 0.1, .2, .3, .4, .5, .6, .7, .8]
 
-    def __init__(self, model: nn.Module, train_data, test_data, optimizer):
+    def __init__(self, model: nn.Module, train_data, test_data, optimizer, **kwargs):
         self.model = model
         self.train_data = train_data
         self.test_data = test_data
@@ -456,7 +374,6 @@ class Wrapper(ABC):
                     out = out.mean(0)
 
                 out = out.argmax(dim=-1)
-                # out = out.sum(0)
                 test_pred.extend(out.tolist())
 
         return test_true, test_pred
@@ -497,25 +414,12 @@ class Wrapper(ABC):
 
                     top_score, top_label = torch.topk(out, 2)
 
-                    # H.extend(top_score[:, 0].tolist())
                     diff.extend(((top_score[:, 0] - top_score[:, 1]) ** 2).tolist())
 
             H = -np.log(np.mean(H))
-            # print(percentage, np.log(np.mean(a)))
-            # input()
-
-            # p_hat = np.asarray(H)
-            #
-            # mean_diff = np.mean(diff)
-            #
-            # epistemic = np.mean(p_hat ** 2, axis=0) - np.mean(p_hat, axis=0) ** 2
-            # aleatoric = np.mean(p_hat * (1 - p_hat), axis=0)
-            #
-            # entropy = aleatoric + epistemic
 
             HS.append(H)
 
-            # DIFF.append(mean_diff)
             scores.append(metrics.f1_score(true_label, pred_label, average='micro'))
 
         self.test_data.dataset.transform = ts_copy
@@ -593,74 +497,8 @@ class Wrapper(ABC):
 
             correctly_predicted_h.append(_correctly_predicted)
             wrongly_predicted_h.append(_wrongly_predicted)
-        # correctly_predicted, wrongly_predicted = np.asarray(correctly_predicted), np.asarray(wrongly_predicted)
 
         return (correctly_predicted, wrongly_predicted), (correctly_predicted_h, wrongly_predicted_h)
-
-    # def fgsm_test_entropy(self, samples=1):
-    #
-    #     correctly_predicted = []
-    #     wrongly_predicted = []
-    #
-    #     self.model.eval()
-    #     loss = cross_entropy_loss('mean')
-    #
-    #     for eps in tqdm(self.epsilons, desc='Attack test', leave=False):
-    #
-    #         H = []
-    #         pred_label = []
-    #         true_label = []
-    #
-    #         self.model.eval()
-    #         for i, (x, y) in enumerate(self.test_data):
-    #             true_label.extend(y.tolist())
-    #
-    #             x = x.to(self.device)
-    #             y = y.to(self.device)
-    #
-    #             self.model.zero_grad()
-    #             x.requires_grad = True
-    #
-    #             out = self.model.eval_forward(x.to(self.device), samples=samples)
-    #             ce = loss(out, y)
-    #             ce.backward()
-    #
-    #             with torch.no_grad():
-    #                 perturbed_data = fgsm_attack(x, eps)
-    #
-    #                 out = self.model.eval_forward(perturbed_data, samples=samples)
-    #
-    #                 a, _ = entropy(out)
-    #                 H.extend(a)
-    #
-    #                 out = torch.softmax(out, -1)
-    #                 if out.dim() > 2:
-    #                     out = out.mean(0)
-    #
-    #                 pred_label.extend(out.argmax(dim=-1).tolist())
-    #
-    #                 # top_score, top_label = torch.topk(out, 2)
-    #
-    #         # H = np.mean(-np.log(H + 1e-12))
-    #
-    #         # print(np.mean([H[i] for i in range(len(true_label)) if true_label[i] == pred_label[i]]))
-    #         # print(np.mean([H[i] for i in range(len(true_label)) if true_label[i] != pred_label[i]]))
-    #
-    #         _correctly_predicted = []
-    #         _wrongly_predicted = []
-    #
-    #         for i in range(len(true_label)):
-    #             if true_label[i] == pred_label[i]:
-    #                 _correctly_predicted.append(H[i])
-    #             else:
-    #                 _wrongly_predicted.append(H[i])
-    #
-    #         correctly_predicted.append(_correctly_predicted)
-    #         wrongly_predicted.append(_wrongly_predicted)
-    #
-    #     # correctly_predicted, wrongly_predicted = np.asarray(correctly_predicted), np.asarray(wrongly_predicted)
-    #
-    #     return correctly_predicted, wrongly_predicted
 
     def white_noise_test(self, samples=1):
 
@@ -727,7 +565,6 @@ class Wrapper(ABC):
 
                 correctly_predicted_h.append(_correctly_predicted)
                 wrongly_predicted_h.append(_wrongly_predicted)
-        # correctly_predicted, wrongly_predicted = np.asarray(correctly_predicted), np.asarray(wrongly_predicted)
 
         self.test_data.dataset.transform = ts_copy
 
@@ -750,12 +587,11 @@ class Wrapper(ABC):
                 if hasattr(out, '__call__') and hasattr(out, 'sample'):
                     scaling = out.sample(out.size()[-1])
 
-                out = torch.div(out, scaling)
-
-                out = torch.softmax(out, -1)
-
                 if out.dim() > 2:
                     out = out.mean(0)
+
+                out = torch.softmax(out, -1)
+                out = torch.div(out, scaling)
 
                 prob, pred = torch.topk(out, 1, -1)
                 y_prob.extend(prob.tolist())
@@ -770,11 +606,16 @@ class Wrapper(ABC):
         ece = 0
         nll = -np.sum(np.log(y_prob))
 
+        mce = []
+
         for b in range(1, int(bins) + 1):
             i = np.logical_and(y_prob <= b / bins, y_prob > (b - 1) / bins)  # indexes for p in the current bin
 
             s = np.sum(i)
+
             if s == 0:
+                prob_pred = np.hstack((prob_pred, 0))
+                prob_true = np.hstack((prob_true, 0))
                 continue
 
             m = 1 / s
@@ -784,7 +625,9 @@ class Wrapper(ABC):
             prob_pred = np.hstack((prob_pred, conf))
             prob_true = np.hstack((prob_true, acc))
 
-            ece += s / len(y_true) * np.abs(acc - conf)
+            mce.append(np.abs(acc - conf))
+
+            ece += (s / len(y_true)) * np.abs(acc - conf)
 
         return prob_pred, prob_true, ece, nll
 
@@ -809,214 +652,61 @@ class Wrapper(ABC):
 
     def temperature_scaling(self, samples=1, **kwargs):
         #  Based on https://github.com/gpleiss/temperature_scaling/
-        temperature = nn.Parameter(torch.ones(10, device=self.device) * 1.5, requires_grad=True)
-        # temperature = Exponential(temp)
+        temperature = nn.Parameter(torch.ones(1, device=self.device) * 1, requires_grad=True)
 
-        self.model.eval()
+        optimizer = optim.Adam([temperature], lr=0.1)
 
-        nll_criterion = nn.CrossEntropyLoss()
+        outs = torch.tensor([], dtype=torch.long, requires_grad=False)
 
-        _, _, before_ece, before_nll = self.reliability_diagram(samples=samples)
+        best_ece = self.reliability_diagram(samples=1)[-2]
 
-        optimizer = optim.LBFGS([temperature], lr=0.05, max_iter=20)
+        for i, (x, y) in enumerate(self.test_data):
+            optimizer.zero_grad()
 
-        def eval():
+            out = self.model.eval_forward(x.to(self.device), samples=1)
 
-            loss = 0
+            if out.dim() > 2:
+                out = out.mean(0)
 
-            # with torch.no_grad():
-            for i, (x, y) in tqdm(enumerate(self.test_data), leave=False, total=len(self.test_data)):
-                x = x.to(self.device)
-                y = y.to(self.device)
+            out = torch.softmax(out, -1)
+            _, pred = torch.topk(out, 1, -1)
 
-                with torch.no_grad():
-                    out = self.model.eval_forward(x.to(self.device), samples=samples)
+            outs = torch.cat((outs, pred.cpu()))
 
-                out = torch.div(out, temperature)
+        for i in range(100):
 
-                if out.dim() > 2:
-                    out = out.mean(0)
+            optimizer.zero_grad()
+            _outs = torch.div(outs.to(self.device), temperature)
 
-                loss += nll_criterion(out, y)
-
-            loss = torch.div(loss, i)
+            loss = torch.sum(torch.log(_outs + 1e-12))
             loss.backward()
+            optimizer.step()
 
-            #
-            #         logits_list.extend(out)
-            #         labels_list.extend(y)
-            #
-            #         # break
-            #
-            # logits = torch.stack(logits_list)  # .to(self.device)
-            # labels = torch.stack(labels_list)  # .to(self.device)
+            _, _, ece, _ = self.reliability_diagram(samples=samples, scaling=temperature.item())
 
-            # print(logits.shape)
-            # logits = torch.div(logits, temperature)
+            if ece < best_ece:
+                best_ece = ece
+            else:
+                break
 
-            # _, _, ece, _ = self.reliability_diagram(samples=samples, scaling=temperature)
-
-            # print(logits.size())
-            # if hasattr(temperature, 'sample'):
-            #     scaling = temperature.rsample()
-            #     input(scaling.sample())
-            # else:
-            #     scaling = temperature
-
-            # print(scaling)
-
-            # loss = nll_criterion(logits, labels)
-            # print(loss.item(), temperature.tolist())
-            # loss.backward()
-
-            return loss
-
-        optimizer.step(eval)
-
-        a, b, ece, nll = self.reliability_diagram(samples=samples, scaling=temperature)
-
-        test_true, test_pred = self.test_evaluation(samples=samples)
-        f1 = metrics.f1_score(test_true, test_pred, average='micro')
-
-        print(temperature.tolist(), before_ece * 100, ece * 100, f1)
-
-        return a, b, ece, nll
+        return best_ece
 
 
-if __name__ == '__main__':
+class Network(nn.Module, ABC):
+    def __init__(self, classes, regression=False):
+        super().__init__()
+        self.classes = classes
+        self.regression = regression
+        self.features = []
 
-    def prova(inp):
-        if inp.dim() == 2:
-            inp = inp.unsqueeze(0)
+        if regression:
+            self.noise = nn.Parameter(torch.tensor(0.0))
 
-        p = inp
-        p_hat = torch.mean(p, 0)
+    @abstractmethod
+    def eval_forward(self, x, **kwargs):
+        pass
 
-        p = p.detach().cpu().numpy()
-        p = np.transpose(p, (1, 0, 2))
-
-        p_hat = p_hat.detach().cpu().numpy()
-
-        t = p.shape[1]
-        classes = p.shape[-1]
-
-        determinants = []
-        variances = []
-
-        mn = 1/classes**classes
-        mx = mn * (2**(classes-1))
-
-        a = np.diag(p_hat)
-        input(p_hat)
-
-        for _bi in range(p.shape[0]):
-            _bp = p[_bi]
-            _bp_hat = p_hat[_bi]
-
-            al = np.zeros((classes, classes))
-            ep = np.zeros((classes, classes))
-
-            for i in range(t):
-                _p = _bp[i]
-                aleatoric = np.diag(_p) - np.outer(_p, _p)
-                al += aleatoric
-                d = _p - _bp_hat
-                epistemic = np.outer(d, d)
-                ep += epistemic
-
-            print(al, ep)
-            al /= t
-            ep /= t
-
-            variances.append(al+ep+(np.eye(classes) / classes))
-
-            det = np.linalg.det(variances[-1])
-
-            det = (det - mn) / (mx-mn)
-            determinants.append(det)
-
-        determinants = np.asarray(determinants)
-        variances = np.asarray(variances)
-
-        return determinants, variances
-
-    def prova_1(inp):
-        if inp.dim() == 2:
-            inp = inp.unsqueeze(0)
-
-        p = inp
-        p_hat = torch.mean(p, 0)
-
-        p = p.detach().cpu().numpy()
-        p = np.transpose(p, (1, 0, 2))
-
-        p_hat = p_hat.detach().cpu().numpy()
-
-        t = p.shape[1]
-        classes = p.shape[-1]
-
-        determinants = []
-        variances = []
-
-        mn = 1/classes**classes
-        mx = mn * (2**(classes-1))
-
-        for _bi in range(p.shape[0]):
-            _bp = p[_bi]
-            _bp_hat = p_hat[_bi]
-
-            entropy = -np.inner(_bp_hat, np.log(_bp_hat+1e-12))
-
-            # al = np.zeros((classes, classes))
-            # ep = np.zeros((classes, classes))
-            #
-            # for i in range(t):
-            #     _p = _bp[i]
-            #     aleatoric = np.diag(_p) - np.outer(_p, _p)
-            #     al += aleatoric
-            #     d = _p - _bp_hat
-            #     epistemic = np.outer(d, d)
-            #     ep += epistemic
-            #
-            # al /= t
-            # ep /= t
-            #
-            # variances.append(al+ep+(np.eye(classes) / classes))
-            #
-            # det = np.linalg.det(variances[-1])
-            #
-            # det = (det - mn) / (mx-mn)
-            # determinants.append(det)
-            determinants.append(entropy)
-
-        determinants = np.asarray(determinants)
-        variances = np.asarray(variances)
-
-        return determinants, variances
-
-    x = torch.tensor(
-        [
-            [
-                [0.25, 0.25, 0.25, 0.25],
-            ]
-        ],
-        dtype=torch.float
-    ).permute(1, 0, 2)
-
-    print(x.shape)
-    d = (1/x.shape[-1])**x.shape[-1]
-    print(d)
-
-    a, b = prova(x)
-    print(a)
-
-    a, b = prova_1(x)
-    print(a)
-
-    # a, _ = epistemic_aleatoric_uncertainty(x)
-    # print(a)
-
-    # print(len(list(permutations( [[1, 0, 0, 0 ],
-    #             [0, 1, 0, 0],
-    #             [0, 0, 1, 0],
-    #             [0, 0, 0, 1]]))))
+    def set_mask(self, p):
+        for i in self.features:
+            if isinstance(i, (BayesianLinearLayer, BayesianCNNLayer)):
+                i.set_mask(p)

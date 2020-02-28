@@ -1,6 +1,8 @@
-import csv
 import pickle
 import time
+import json
+import sys
+import numpy as np
 
 import matplotlib.pyplot as plt
 import torch
@@ -85,31 +87,12 @@ def get_dataset(name, batch_size, dev_split, resize=None, train_subset=0):
     shuffle = True
 
     if train_subset > 0:
-        # print(train_split.data[0][0][0])
 
         train_size = int(train_subset * len(train_split))
         idx = np.random.choice(train_split.data.shape[0], train_size, replace=False)
-        # idx = sorted(idx)
-        # idx = np.random.randint(train_split.data.shape[0], size=train_size)
-        # print(idx)|
-        # train_split.data = train_split.data[idx]
+
         sampler = SubsetRandomSampler(idx)
         shuffle = False
-        # print(train_split.data.shape)
-        #
-        # print(train_split.data[0][0][0])
-
-    # if dev_split > 0:
-    #     train_size = int((1 - dev_split) * len(train_split))
-    #     test_size = len(train_split) - train_size
-    #
-    #     train_split, dev_split = torch.utils.data.random_split(train_split, [train_size, test_size])
-    #
-    #     train_loader = torch.utils.data.DataLoader(train_split, batch_size=batch_size, shuffle=True)
-    #
-    #     test_loader = torch.utils.data.DataLoader(dev_split, batch_size=batch_size, shuffle=False)
-    #
-    # else:
 
     train_loader = torch.utils.data.DataLoader(train_split, batch_size=batch_size, shuffle=shuffle, sampler=sampler)
 
@@ -174,19 +157,19 @@ def main(experiment):
         test_samples = data.get('test_samples', 2)
         exp_name = data['exp_name']
 
-        if 'label' not in data:
-            data['label'] = exp_name
-
         save = data['save']
         load = data['load']
         dev_split = data.get('dev_split', 0)
         local_trick = data.get('local_trick', False)
         network_parameters = data.get('network_parameters', {})
         posterior_type = data.get('posterior_type', 'weights')
+
         moment = data.get('moment', 0)
         early_stopping_tolerance = data.get('early_stopping_tolerance', 3)
         resize = data.get('resize', None)
-        weight_decay = data.get('weight_decay', 0)
+
+        weight_decay = data.get('weight_decay', 1e-5 if network == 'dropout' else 0)
+
         lr_scheduler = data.get('lr_scheduler', None)
 
         train_subset = data.get('train_subset', 0)
@@ -283,9 +266,9 @@ def main(experiment):
             print('Parametri: ', pytorch_total_params)
 
             if optimizer != 'adam':
-                opt = _opt(model.parameters(), lr=lr, momentum=moment, weight_decay=weight_decay)
+                opt = _opt(model.parameters(), lr=lr, momentum=moment)
             else:
-                opt = _opt(model.parameters(), lr=lr, weight_decay=weight_decay)
+                opt = _opt(model.parameters(), lr=lr)
 
             scheduler = None
 
@@ -339,14 +322,12 @@ def main(experiment):
                 if scheduler is not None:
                     scheduler.load_state_dict(results['optimizer_state_dict'])
 
-                # print(results.get('train_results'))
-
                 best_score = np.max(results.get('test_results'))
 
                 if load_path != save_path:
                     copy(os.path.join(current_load_path, 'best_model_{}.data'.format(e)), results_path)
 
-            t = trainer(model, train_loader, test_loader, opt)
+            t = trainer(model, train_loader, test_loader, opt, wd=weight_decay)
 
             if early_stopping[1] < early_stopping_tolerance:
                 trained = True
@@ -434,15 +415,19 @@ def main(experiment):
 
             # Reliability diagram and ECE
 
-            if os.path.exists(os.path.join(current_path, "{}_temp_scaling.data".format(e))) and not trained:
-                pass
-                # with open(os.path.join(current_path, "{}_temp_scaling.data".format(e)), "rb") as f:
-                #     r = pickle.load(f)
-            else:
-                r1 = t.reliability_diagram(samples=test_samples)
-                r = (r1[-2], r1[-2])
-                with open(os.path.join(current_path, "{}_temp_scaling.data".format(e)), "wb") as f:
+            if not os.path.exists(os.path.join(current_path, "{}_ece.data".format(e))):
+                pp, pt, ece, nll = t.reliability_diagram(samples=1)
+
+                r1 = (pp, pt)
+
+                scaled_ece = t.temperature_scaling(samples=1)
+                r = (ece, scaled_ece)
+
+                with open(os.path.join(current_path, "{}_ece.data".format(e)), "wb") as f:
                     pickle.dump(r, f)
+    
+                with open(os.path.join(current_path, "{}_ece_barplot.data".format(e)), "wb") as f:
+                    pickle.dump(r1, f)
 
             print('Max test score {}: {}'.format(seed, np.max(results.get('test_results')[1:])))
 
@@ -452,22 +437,16 @@ def main(experiment):
 
                 fgsm_path = os.path.join(current_path, 'fgsm_{}.data'.format(e))
 
-                if not os.path.exists(fgsm_path):
+                if not os.path.exists(fgsm_path) and save:
                     r = t.fgsm_test(samples=test_samples)
-                    # fgsm_re   sults, fgsm_entropy_results = r
 
-                    if save:
-                        with open(fgsm_path, "wb") as output_file:
-                            pickle.dump(r, output_file)
+                    with open(fgsm_path, "wb") as output_file:
+                        pickle.dump(r, output_file)
 
     return experiments_results
 
 
 if __name__ == '__main__':
-    import json
-    import sys
-    import numpy as np
-
     args = sys.argv[1:]
 
     with open(args[0], "r") as read_file:

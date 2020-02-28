@@ -1,20 +1,20 @@
 import pickle
-import time
 
 import matplotlib.pyplot as plt
 import torch
 import torchvision
+from scipy.interpolate import make_interp_spline
 from scipy.stats import gaussian_kde
-from sklearn.metrics import confusion_matrix
 from torch.utils.data import SubsetRandomSampler
 from torchvision import datasets
 from torchvision.transforms import transforms
 import random
-from shutil import copy
+import json
+import sys
+import numpy as np
 import ANN
 import DropoutNet
 from base import Wrapper
-from priors import Gaussian, Laplace, ScaledMixtureGaussian, Uniform
 from bayesian_layers import BayesianCNNLayer, BayesianLinearLayer
 import csv
 from itertools import cycle
@@ -27,9 +27,33 @@ font = {'font.family': 'serif',
         'ytick.labelsize': 11,
         'figure.figsize': [4, 3],
         'text.usetex': False,
-        'font.serif': ['Times New Roman'] + plt.rcParams['font.serif']}
+        'font.serif': ['Times New Roman'] + plt.rcParams['font.serif'],
+        'figure.autolayout': True}
 
 plt.rcParams.update(font)
+
+
+def smoother(x, space, points=300):
+    xnew = np.linspace(np.min(space), np.max(space), points)
+    spl = make_interp_spline(range(len(x)), x, k=3)
+    power_smooth = spl(xnew)
+
+    return xnew, power_smooth
+
+
+def moving_average(x, n=3):
+    out = np.zeros_like(x, dtype=np.float64)
+    dim_len = x.shape[0]
+    for i in range(dim_len):
+        if n % 2 == 0:
+            a, b = i - (n - 1) // 2, i + (n - 1) // 2 + 2
+        else:
+            a, b = i - (n - 1) // 2, i + (n - 1) // 2 + 1
+
+        a = max(0, a)
+        b = min(dim_len, b)
+        out[i] = np.mean(x[a:b])
+    return out
 
 
 def unbalanced_mean_std(x):
@@ -112,31 +136,10 @@ def get_dataset(name, batch_size, dev_split, resize=None, train_subset=0):
     shuffle = True
 
     if train_subset > 0:
-        # print(train_split.data[0][0][0])
-
         train_size = int(train_subset * len(train_split))
         idx = np.random.choice(train_split.data.shape[0], train_size, replace=False)
-        # idx = sorted(idx)
-        # idx = np.random.randint(train_split.data.shape[0], size=train_size)
-        # print(idx)|
-        # train_split.data = train_split.data[idx]
         sampler = SubsetRandomSampler(idx)
         shuffle = False
-        # print(train_split.data.shape)
-        #
-        # print(train_split.data[0][0][0])
-
-    # if dev_split > 0:
-    #     train_size = int((1 - dev_split) * len(train_split))
-    #     test_size = len(train_split) - train_size
-    #
-    #     train_split, dev_split = torch.utils.data.random_split(train_split, [train_size, test_size])
-    #
-    #     train_loader = torch.utils.data.DataLoader(train_split, batch_size=batch_size, shuffle=True)
-    #
-    #     test_loader = torch.utils.data.DataLoader(dev_split, batch_size=batch_size, shuffle=False)
-    #
-    # else:
 
     train_loader = torch.utils.data.DataLoader(train_split, batch_size=batch_size, shuffle=shuffle, sampler=sampler)
 
@@ -145,7 +148,7 @@ def get_dataset(name, batch_size, dev_split, resize=None, train_subset=0):
     return sample, classes, train_loader, test_loader
 
 
-def plot_test(exps, tests, path, type='uncertainty', whist=1.5):
+def plot_test(exps, tests, path, type='uncertainty', whist=2):
     tot_scores = []
 
     for d, t in zip(exps, tests):
@@ -171,8 +174,6 @@ def plot_test(exps, tests, path, type='uncertainty', whist=1.5):
 
             score = len(c) / (len(c) + len(w))
 
-            # print('Score', score)
-
             if i == 0:
                 threshold = np.quantile(c, 0.75) + whist * (np.quantile(c, 0.75) - np.quantile(c, 0.25))
 
@@ -187,11 +188,6 @@ def plot_test(exps, tests, path, type='uncertainty', whist=1.5):
 
                 scores.append(score)
                 scores_keep.append(keep_score)
-                # print('old_score/new_score', keep_score / score, '\n',
-                #       'Percentage corrected classified keep', len(keep_c) / len(c), '\n',
-                #       'Percentage wrongly classified keep', len(keep_w) / len(w), '\n',
-                #       'Keep score', len(keep_c) / (len(keep_w) + len(keep_c)))
-                # print()
 
             scores.append(score)
             scores_keep.append(keep_score)
@@ -213,16 +209,6 @@ def plot_test(exps, tests, path, type='uncertainty', whist=1.5):
         fig_wro.savefig(os.path.join(path, "{}_{}_wrong.pdf".format(d['label'], type)),
                         bbox_inches='tight', pad_inches=0)
 
-        # ax_score.plot(range(len(scores)), scores_keep, linestyle='--',
-        #               label='Keep score', c=d['color'], linewidth=2)
-        #
-        # ax_score.plot(range(len(scores)), scores, linestyle='-',
-        #               label='Original score', c=d['color'], linewidth=2)
-        #
-        # fig_scores.savefig(os.path.join(path, "{}_{}_scores.pdf".format(d['label'], type)),
-        #                    bbox_inches='tight', pad_inches=0)
-        #
-        # fig_scores.legend()#, prop={'size': 25})
 
         plt.close('all')
 
@@ -231,21 +217,10 @@ def plot_test(exps, tests, path, type='uncertainty', whist=1.5):
 
 
 def uncertainty_test(exps, tests, whists=None):
-    tot_scores = []
-
-    # for t in tests:
-
-    # cm, cv = [], []
-    # wm, wv = [], []
-    #
-    # scores_keep = []
-    # scores = []
-    # if t is None:
-    #     continue
 
     threshold = np.inf
     if whists is None:
-        whists = [None, 0.25, 0.5, 0.75, 1, 1.5, 2, 2.5]
+        whists = [None, 0.25, 0.5, 0.75, 1, 2, 2, 2.5]
 
     discard = np.zeros((len(tests[0]), len(whists)))
     keep = np.zeros((len(tests[0]), len(whists)))
@@ -256,24 +231,12 @@ def uncertainty_test(exps, tests, whists=None):
         for j, whist in enumerate(whists):
             c, w = tests[0][eps], tests[1][eps]
 
-            # w = np.asarray(w)
-
-            # score = len(c) / (len(c) + len(w))
-
-            # if eps == 0:
-            # c = np.asarray(c)
-
             if whist is None:
                 threshold = 0
             else:
                 threshold = np.quantile(c, 0.75) + whist * (np.quantile(c, 0.75) - np.quantile(c, 0.25))
-            # print(threshold)
             # else:
             all = c + w
-
-            # cm.append(c)
-            # wm.append(w)
-            # print(all)
 
             _disc = [k for k in all if k > threshold]
             _keep = [k for k in all if k <= threshold]
@@ -291,27 +254,11 @@ def uncertainty_test(exps, tests, whists=None):
                 keep_score = len(keep_c) / div
 
             scores[eps, j] = keep_score
-            # keep_score = score
-            # if i > 0:
-            # keep_score = len(keep_c) / (len(keep_w) + len(keep_c))
 
-            # scores.append(score)
-            # scores_keep.append(keep_score)
-            # print('old_score/new_score', keep_score / score, '\n',
-            #       'Percentage corrected classified keep', len(keep_c) / len(c), '\n',
-            #       'Percentage wrongly classified keep', len(keep_w) / len(w), '\n',
-            #       'Keep score', len(keep_c) / (len(keep_w) + len(keep_c)))
-            # print()
-
-            # scores.append(score)
-            # scores_keep.append(keep_score)
-
-    # tot_scores.append((scores, scores_keep))
     return keep, discard, scores
 
 
 def main(experiment):
-    import sklearn.metrics as metrics
     import tqdm as tqdm
 
     import BBB
@@ -323,12 +270,8 @@ def main(experiment):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    Optimizers = ['sgd', 'adam', 'rmsprop']
     NetworkTypes = ['bbb', 'mmd', 'normal', 'dropout']
     Datasets = ['fMNIST', 'MNIST', 'CIFAR10', 'CIFAR100']
-    PosteriorType = ['layers', 'neurons', 'weights', 'multiplicative']
-    LrScheduler = ['step', 'exponential', 'plateau']
-    Priors = ['gaussian', 'laplace', 'uniform', 'scaledGaussian']
 
     linestyles = ['--', '-.', '-', ':']
 
@@ -338,7 +281,7 @@ def main(experiment):
     all_fgsm_results = []
     all_fgsm_entropy_results = []
     all_reliability = []
-    conf_matrices = []
+    all_bars = []
 
     hists = []
     all_ws = []
@@ -348,14 +291,11 @@ def main(experiment):
     if not os.path.exists(experiments_path):
         os.makedirs(experiments_path)
 
-    # input(experiments_path)
-
     experiments = experiment['experiments']
 
     cm = plt.get_cmap('tab20')
     cm = iter(cm.colors)
 
-    # print(cm.colors)
     for data in experiments:
         print(data['save_path'], data['exp_name'])
 
@@ -363,11 +303,9 @@ def main(experiment):
             continue
 
         batch_size = data.get('batch_size', 64)
-        lr = data.get('lr', 1e-3)
         topology = data['topology']
         weights_mu_init = data.get('mu_init', None)
         weights_rho_init = data.get('rho_init', None)
-        optimizer = data.get('optimizer', 'adam').lower()
         dataset = data["dataset"]
         network = data["network_type"].lower()
         # experiments = data.get('experiments', 1)
@@ -376,12 +314,9 @@ def main(experiment):
         save_path = data['save_path']
         load_path = data.get('load_path', save_path)
 
-        loss_weights = data.get('loss_weights', {})
-
-        epochs = data['epochs']
-        train_samples = data.get('train_samples', 2)
         test_samples = data.get('test_samples', 2)
         exp_name = data['exp_name']
+        seeds = [0, 1, 2]
 
         if 'label' not in data:
             data['label'] = exp_name
@@ -405,39 +340,11 @@ def main(experiment):
         train_subset = data.get('train_subset', 0)
         # PRIORS
 
-        # prior = None
-        # data_prior = data.get('prior')
-        #
-        # if data_prior:
-        #     t = data_prior.get('type')
-        #     if t not in Priors:
-        #         raise ValueError('Supported priors', list(Priors))
-        #     else:
-        #         if t == 'gaussian':
-        #             prior = Gaussian(data_prior['mu'], data_prior['sigma'])
-        #         elif t == 'laplace':
-        #             prior = Laplace(data_prior['mu'], data_prior['scale'])
-        #         elif t == 'scaledGaussian':
-        #             prior = ScaledMixtureGaussian(pi=data_prior['phi'], mu1=data_prior['mu1'], s1=data_prior['sigma1'],
-        #                                           mu2=data_prior['mu2'], s2=data_prior['sigma2'])
-        #         elif t == 'uniform':
-        #             a, b = data_prior['a'], data_prior['b']
-        #             if network == 'bbb':
-        #                 a = torch.tensor([float(a)])
-        #                 b = torch.tensor([float(b)])
-        #             prior = Uniform(a=a, b=b)
-
-        # if epochs < 0:
-        #     raise ValueError('The number of epoch should be > 0')
-
         if train_subset < 0 or train_subset > 1:
             raise ValueError('The train subset to sample needs be a percentage (> 0 and < 1)')
 
         if isinstance(seeds, int):
             seeds = [seeds]
-
-        # if posterior_type not in PosteriorType:
-        #     raise ValueError('Supported posterior_type', PosteriorType)
 
         if network not in NetworkTypes:
             raise ValueError('Supported networks', NetworkTypes)
@@ -477,6 +384,7 @@ def main(experiment):
         _fgsm = []
         _fgsm_entropy = []
         local_reliability = []
+        local_bars = []
 
         for e, seed in tqdm.tqdm(enumerate(seeds), total=len(seeds)):
 
@@ -496,7 +404,7 @@ def main(experiment):
 
             model.to(device)
 
-            current_path = os.path.join(save_path, exp_name)  # , str(e))
+            current_path = os.path.join(save_path, exp_name)
             current_load_path = os.path.join(load_path, exp_name)
 
             results_path = os.path.join(current_path, 'results_{}.data'.format(e))
@@ -519,44 +427,30 @@ def main(experiment):
             t.model.load_state_dict(torch.load(best_path))
             run_results.append(results)
 
-            # Reliability diagram and ECE
+            if not os.path.exists(os.path.join(current_path, "{}_ece.data".format(e))):
+                assert False
 
-            # if os.path.exists(os.path.join(current_path, "{}_temp_scaling.data".format(e))):
-            with open(os.path.join(current_path, "{}_temp_scaling.data".format(e)), "rb") as f:
+            with open(os.path.join(current_path, "{}_ece.data".format(e)), "rb") as f:
                 r = pickle.load(f)
 
-            local_reliability.append(r)
+            with open(os.path.join(current_path, "{}_ece_barplot.data".format(e)), "rb") as f:
+                r1 = pickle.load(f)
 
-            # Confusion matrix
-            plt.close('all')
-            true_class, pred_class = t.test_evaluation(samples=test_samples)
-            conf_matrix = confusion_matrix(true_class, pred_class)
-            plt.matshow(conf_matrix)
-            plt.savefig(os.path.join(current_path, "{}_conf_matrix.pdf".format(e)),
-                        bbox_inches='tight')
+            local_reliability.append(r)
+            local_bars.append(r1)
 
             fgsm_results = None
             fgsm_entropy_results = None
 
             if network != 'normal':
 
-                # entropy_path = os.path.join(current_path, 'fgsm_entropy_{}.data'.format(e))
                 fgsm_path = os.path.join(current_path, 'fgsm_{}.data'.format(e))
 
                 if os.path.exists(fgsm_path):
                     with open(fgsm_path, "rb") as f:
                         fgsm_results, fgsm_entropy_results = pickle.load(f)
-
-                # if fgsm_results is None:
-                #     r = t.fgsm_test(samples=test_samples)
-                #     fgsm_results, fgsm_entropy_results = r
-                #
-                #     if save:
-                #         with open(fgsm_path, "wb") as output_file:
-                #             pickle.dump(r, output_file)
-
-                # Variance matrix
-                # plt.close('all')
+                else:
+                    assert False
 
             _fgsm_entropy.append(fgsm_entropy_results)
             _fgsm.append(fgsm_results)
@@ -597,30 +491,35 @@ def main(experiment):
                 plt.close('all')
 
                 fig, ax = plt.subplots()
+                fig.set_figheight(3)
+                fig.set_figwidth(4)
 
                 for l, w in enumerate(ws):
                     offset = np.abs(np.min(w) - np.max(w)) * 0.1
                     xs = np.linspace(np.min(w) - offset, np.max(w) + offset, 200)
                     density = gaussian_kde(w)
                     density._compute_covariance()
-                    plt.plot(xs, density(xs))#, label="Layer #{}: {}".format(l + 1, labels[l]), linewidth=1)
+                    plt.plot(xs, density(xs))
 
-                plt.xticks(fontsize=14)
-                plt.yticks(fontsize=14)
-                plt.grid(True, alpha=0.2)
-                plt.ylabel('frequency')
+                ax.grid(True, alpha=0.2)
+                ax.set_ylabel('frequency')
+                ax.margins(y=0)
+                ax.set_xlim(-0.5, 0.5)
+
+                mn, mx = ax.get_ylim()
+                ax.set_ylim(mn, mx + (mx * 0.2))
 
                 fig.savefig(os.path.join(current_path, "{}_{}_posterior.pdf".format(e, network)),
                             bbox_inches='tight', pad_inches=0)
                 plt.close(fig)
 
         all_reliability.append(local_reliability)
+        all_bars.append(local_bars)
 
         all_fgsm_entropy_results.append(_fgsm_entropy)
         all_fgsm_results.append(_fgsm)
         experiments_results.append(run_results)
 
-    all_reliability = np.asarray(all_reliability)
     experiments = [e for e in experiments if not e.get('skip', False)]
 
     plt.close('all')
@@ -629,7 +528,9 @@ def main(experiment):
     whists = [None, 0, 0.1, .2, 0.4, 0.6, 0.8, 1, 1.5, 2]
 
     for j, d in enumerate(experiments):
-        # for each seed
+
+        if d['network_type'] == 'normal':
+            continue
 
         all_entropy = []
         all_unc = []
@@ -640,44 +541,16 @@ def main(experiment):
             os.makedirs(_threshold_tests)
 
         for i in range(len(all_fgsm_entropy_results[0])):
-
-            if d['network_type'] == 'normal':
-                continue
-            threshold_results = []
-
-            # _threshold_tests = os.path.join(threshold_tests, '{}_{}'.format(i, d['label'].replace('_', ' ')))
-
-
             _entropy = all_fgsm_entropy_results[j][i]
             _uncertainty = all_fgsm_results[j][i]
-
-            # figsize = font['figure.figsize']
-            # _figsize = tuple(map(lambda x: x * 4, figsize))
-
-            # f, axs = plt.subplots(nrows=2, ncols=3, figsize=_figsize)
-
-            # whists_l = [i if i is not None else 'Baseline' for i in whists]
-            # x = range(len(whists))
 
             all_entropy.append(uncertainty_test(experiments, _entropy, whists=whists))
             all_unc.append(uncertainty_test(experiments, _uncertainty, whists=whists))
 
-            for vi, vals in enumerate([_entropy, _uncertainty]):
-                res = uncertainty_test(experiments, vals, whists=whists)
-                threshold_results.append(res)
-
-            #     for k, r in enumerate(res):
-            #         axs[vi, k].matshow(r)
-            #         axs[vi, k].set_yticklabels([''] + Wrapper.epsilons)
-            #         axs[vi, k].set_xticks(x)
-            #         axs[vi, k].set_xticklabels(whists_l, rotation=45)
-            #
-            # f.savefig(os.path.join(_threshold_tests, "heatmaps_{}_{}_wrong.pdf".format(d['label'], i)),
-            #           bbox_inches='tight', pad_inches=0)
-
         eps = Wrapper.epsilons
         whists = whists[1:]
         x = range(len(whists))
+        _x = x
 
         all_entropy = np.asarray(all_entropy)
         all_entropy_m = np.mean(all_entropy, 0)
@@ -690,70 +563,112 @@ def main(experiment):
         for e in range(1, len(eps)):
             ep = eps[e]
 
-            # entr_disc = threshold_results[0][1][e, 1:]
             entr_disc = all_entropy_m[1, e, 1:]
             entr_disc_std = all_entropy_std[1, e, 1:]
 
-            # unc_disc = threshold_results[1][1][e, 1:]
             unc_disc = all_unc_m[1, e, 1:]
             unc_disc_std = all_unc_std[1, e, 1:]
-
-            # entr_score = threshold_results[0][-1][e, 1:] * 100
-            # unsc_score = threshold_results[1][-1][e, 1:] * 100
 
             entr_score = all_entropy[:, 2, e, 1:] * 100
             unsc_score = all_unc[:, 2, e, 1:] * 100
 
             score_diff_m = np.mean(unsc_score - entr_score, 0)
             score_diff_std = np.std(unsc_score - entr_score, 0)
-            # diff = unsc_score - entr_score
 
-            f, axs = plt.subplots(nrows=1, ncols=1)  # , figsize=_figsize)
-            axs.plot(x, score_diff_m, label='Unc. - Entropy', linestyle='-')
-            axs.fill_between(x, score_diff_m - score_diff_std, score_diff_m + score_diff_std, alpha=0.1, color=d['color'])
+            _, score_diff_m = smoother(score_diff_m, _x)
+            x1, score_diff_std = smoother(score_diff_std, _x)
+
+            f, axs = plt.subplots(nrows=1, ncols=1)
+            f.set_figheight(3 * 1)
+            f.set_figwidth(4 * 1)
+
+            axs.plot(x1, score_diff_m, label='BCU - Entropy', linestyle='-', color='r')
+            axs.fill_between(x1, score_diff_m - score_diff_std, score_diff_m + score_diff_std, alpha=0.1,
+                             color='r')
 
             axs.set_xticks(x)
             axs.set_xticklabels(whists)
-            axs.set_xlabel(r'$\gamma$')
-            axs.set_ylabel('Unc. - Entropy %')
 
-            # plt.fill_between(x, means - stds, means + stds, alpha=0.1, color=d['color'])
+            axs.set_xlabel(r'$\gamma$')
+            axs.set_ylabel('BCU - Entropy (%)')
+            axs.margins(x=0)
 
             axs.grid(True, color="0.9", linestyle='--', linewidth=1)
-            f.savefig(os.path.join(_threshold_tests, "{}_score_difference.pdf".format(ep)),
-                      bbox_inches='tight', pad_inches=0)
 
-            f, axs = plt.subplots(nrows=1, ncols=1)  # , figsize=figsize)
-            axs.plot(x, entr_disc, label='Entropy', linestyle='-')
-            axs.fill_between(x, entr_disc - entr_disc_std, entr_disc + entr_disc_std, alpha=0.1, color=d['color'])
+            f.savefig(os.path.join(_threshold_tests, "{}_score_difference.pdf".format(ep)), )
 
-            axs.plot(x, unc_disc, label='Unc.', linestyle='-.')
-            axs.fill_between(x, unc_disc - unc_disc_std, unc_disc + unc_disc_std, alpha=0.1, color=d['color'])
+            #######################################################################################################
+
+            f, axs = plt.subplots(nrows=1, ncols=1)
+            f.set_figheight(3 * 1)
+            f.set_figwidth(4 * 1)
+
+            x1, entr_disc = smoother(entr_disc, _x)
+            _, entr_disc_std = smoother(entr_disc_std, _x)
+
+
+            axs.plot(x1, entr_disc, label='Entropy', linestyle='-')
+            axs.fill_between(x1, entr_disc - entr_disc_std, entr_disc + entr_disc_std, alpha=0.1)
+
+            x1, unc_disc = smoother(unc_disc, _x)
+            _, unc_disc_std = smoother(unc_disc_std, _x)
+
+            axs.plot(x1, unc_disc, label='BCU', linestyle='-.')
+            axs.fill_between(x1, unc_disc - unc_disc_std, unc_disc + unc_disc_std, alpha=0.1)
 
             axs.set_xticks(x)
             axs.set_xticklabels(whists)
+
             axs.set_xlabel(r'$\gamma$')
             axs.set_ylabel('discarded images')
+            axs.margins(x=0)
+
+            mn, mx = axs.get_ylim()
+            axs.set_ylim(mn, mx+(mx*0.2))
 
             axs.grid(True, color="0.9", linestyle='--', linewidth=1)
-            f.legend(bbox_to_anchor=(0.9, 0.9))  # loc='upper center', ncol=2, bbox_to_anchor=(0.5, 0))
-            f.savefig(os.path.join(_threshold_tests, "{}_disc.pdf".format(ep)),
-                      bbox_inches='tight', pad_inches=0)
+            f.legend(bbox_to_anchor=(0.95, 0.95), ncol=2)
 
-            f, axs = plt.subplots(nrows=1, ncols=1)  # , figsize=figsize)
+            f.savefig(os.path.join(_threshold_tests, "{}_disc.pdf".format(ep)), )
 
-            axs.plot(x, entr_score, label='Entropy', linestyle='-')
-            axs.plot(x, unsc_score, label='Unc.', linestyle='-.')
+            #######################################################################################################
+
+            f, axs = plt.subplots(nrows=1, ncols=1)
+            f.set_figheight(3 * 1)
+            f.set_figwidth(4 * 1)
+
+            entr_score = all_entropy_m[2, e, 1:] * 100
+            entr_std = all_entropy_std[2, e, 1:] * 100
+
+            unsc_score = all_unc_m[2, e, 1:] * 100
+            unc_std = all_unc_std[2, e, 1:] * 100
+
+            x1, entr_score = smoother(entr_score, _x)
+            _, entr_std = smoother(entr_std, _x)
+
+            _, unsc_score = smoother(unsc_score, _x)
+            _, unc_std = smoother(unc_std, _x)
+
+            axs.plot(x1, entr_score, label='Entropy', linestyle='-')
+            axs.fill_between(x1, entr_score - entr_std, entr_score + entr_std, alpha=0.1)
+
+            axs.plot(x1, unsc_score, label='BCU', linestyle='-.')
+            axs.fill_between(x1, unsc_score - unc_std, unsc_score + unc_std, alpha=0.1)
 
             axs.set_xticks(x)
             axs.set_xticklabels(whists)
+            axs.margins(x=0)
+
             axs.set_xlabel(r'$\gamma$')
-            axs.set_ylabel('accuracy %')
+            axs.set_ylabel('accuracy (%)')
 
             axs.grid(True, color="0.9", linestyle='--', linewidth=1)
-            f.legend(bbox_to_anchor=(0.9, 0.9))  # loc='upper center', ncol=2, bbox_to_anchor=(0.5, 0))
-            f.savefig(os.path.join(_threshold_tests, "{}_score.pdf".format(ep)),
-                      bbox_inches='tight', pad_inches=0)
+
+            mn, mx = axs.get_ylim()
+            axs.set_ylim(mn, mx+(mx*0.2))
+            f.legend(bbox_to_anchor=(0.95, 0.95), ncol=2)
+
+            f.savefig(os.path.join(_threshold_tests, "{}_score.pdf".format(ep)), )
 
             plt.close('all')
 
@@ -778,12 +693,14 @@ def main(experiment):
     plt.ylabel("Test score (%)")
     plt.xlabel("Epochs")
 
-    print(os.path.join(experiments_path, "score.pdf"))
     plt.savefig(os.path.join(experiments_path, "score.pdf"), bbox_inches='tight', pad_inches=0)
     plt.close('all')
 
     # Results file writing
 
+    all_reliability = np.asarray(all_reliability)
+    all_bars = np.asarray(all_bars)
+    eces = []
     with open(os.path.join(experiments_path, 'results.csv'), 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(["exp_name", "network", "max_score", "max_score_epoch", "ece", "scaled_ece"])
@@ -793,25 +710,75 @@ def main(experiment):
             r = experiments_results[i]
 
             ece = all_reliability[i, :, 0] * 100
+            scaled_ece = all_reliability[i, :, 1] * 100
 
             res = [i['test_results'] for i in r]
             res, res_std = unbalanced_mean_std(res)
 
             res_i = np.argmax(res)
 
+            eces.append((np.mean(ece), np.std(ece)))
+
             writer.writerow([d.get('label'), d.get('network_type'),
                              '{} +- {}'.format(res[res_i] * 100, res_std[res_i] * 100),
                              res_i,
-                             '{} +- {}'.format(np.mean(ece), np.std(ece)),
-                             '{} +- {}'.format(np.mean(ece), np.std(ece))])
+                             '{} +- {} ({})'.format(np.mean(ece), np.std(ece), np.min(ece)),
+                             '{} +- {} ({})'.format(np.mean(scaled_ece), np.std(scaled_ece), np.min(scaled_ece))])
+
+    for i in range(len(experiments)):
+
+        ece_txt = r'ECE: ${}\pm{}$ %'.format(*[np.round(k, 2) for k in eces[i]])
+
+        _save_path = os.path.join(experiments_path, 'threshold_results', '{}'.
+                                  format(experiments[i]['label'].replace('_', ' ')))
+
+        if not os.path.exists(_save_path):
+            os.makedirs(_save_path)
+
+        f, axs = plt.subplots(nrows=1, ncols=1)  # , figsize=[4, 3])
+
+        axs.text(0.55, 0.05, ece_txt, transform=axs.transAxes,  bbox=dict(boxstyle='round', facecolor='w', alpha=0.9))
+
+        f.set_figheight(3 * 1)
+        f.set_figwidth(4 * 1)
+
+        bars = all_bars[i]
+        bars_m = bars.mean(0)
+        bars_std = np.std(bars, 0)
+
+        width = 1 / len(bars_m[0])
+
+        x = np.linspace(0 + width / 2, 1 - width / 2, len(bars_m[0]))
+
+        axs.grid(True, linestyle='--', linewidth=1, alpha=0.8)
+
+        axs.plot([0, 1], [0, 1], linestyle='-', label='Perfectly calibrated', c='k', linewidth=1)
+
+        axs.bar(x, bars_m[1], width=width, yerr=bars_std[1], fill=True, linewidth=0, color='b', edgecolor='k',
+                error_kw=dict(lw=1, capsize=1, capthick=1), alpha=0.8, zorder=3, label='Outputs')
+
+        axs.bar(x, bars_m[1], width=width, yerr=bars_std[1], fill=False, linewidth=1, color='k', edgecolor='k',
+                error_kw=dict(lw=1, capsize=1, capthick=1), alpha=0.8, zorder=3)
+
+        axs.bar(x, x - bars_m[1], width=width, alpha=0.3, fill=True, linewidth=0, color='r', edgecolor='k', zorder=3,
+                bottom=bars_m[1], label='Gap')
+        axs.bar(x, x - bars_m[1], width=width, fill=False, linewidth=1, edgecolor='darkred', zorder=3, alpha=0.75,
+                bottom=bars_m[1])
+
+        axs.set_xlim(0, 1)
+        axs.set_ylim(0, 1)
+        axs.set_xlabel('confidence')
+        axs.set_ylabel('accuracy')
+
+        f.legend(loc='upper left', bbox_to_anchor=(0.13, 0.95), framealpha=1)
+
+        f.savefig(os.path.join(_save_path, "calibration_bars_{}.pdf".format(experiments[i]['network_type'])))
+        plt.close(f)
 
     return experiments_results
 
 
 if __name__ == '__main__':
-    import json
-    import sys
-    import numpy as np
 
     args = sys.argv[1:]
 

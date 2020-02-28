@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch import nn
 from tqdm import tqdm
 
-from base import Network, Wrapper, get_network
+from base import Wrapper, get_network, Network
 
 
 class Dropnet(Network):
@@ -45,18 +45,15 @@ class Dropnet(Network):
 
 
 class Trainer(Wrapper):
-    def __init__(self, model: nn.Module, train_data, test_data, optimizer):
+    def __init__(self, model: nn.Module, train_data, test_data, optimizer, wd=1e-5, **kwargs):
         super().__init__(model, train_data, test_data, optimizer)
+        self.wd = wd
 
     def train_epoch(self, samples=1, **kwargs):
         losses = []
 
-        weights = kwargs.get('weights', {})
-        lreg = weights.get('lambda', 1e-5)
-
         self.model.train()
         progress_bar = tqdm(enumerate(self.train_data), total=len(self.train_data), disable=False, leave=False)
-        # progress_bar.set_postfix(mmd_loss='not calculated', ce_loss='not calculated')
 
         train_true = []
         train_pred = []
@@ -69,7 +66,6 @@ class Trainer(Wrapper):
             self.optimizer.zero_grad()
 
             out = self.model(x, samples=samples)
-            # out = out.mean(0)
 
             if self.regression:
                 out = out.mean(0)
@@ -88,13 +84,12 @@ class Trainer(Wrapper):
 
             train_pred.extend(out.tolist())
 
-            # loss = F.cross_entropy(out, y.to(self.device), reduction='mean')
+            if self.wd != 0:
+                l2_reg = torch.tensor(0.).to(self.device)
+                for param in self.model.parameters():
+                    l2_reg += torch.norm(param)
 
-            l2_reg = torch.tensor(0.).to(self.device)
-            for param in self.model.parameters():
-                l2_reg += torch.norm(param)
-
-            loss += lreg*l2_reg
+                loss += self.wd*l2_reg
 
             losses.append(loss.item())
             loss.backward()
@@ -103,23 +98,6 @@ class Trainer(Wrapper):
             progress_bar.set_postfix(ce_loss=loss.item())
 
         return losses, (train_true, train_pred)
-
-    # def test_evaluation(self, samples, **kwargs):
-    #
-    #     test_pred = []
-    #     test_true = []
-    #
-    #     self.model.eval()
-    #     with torch.no_grad():
-    #         for i, (x, y) in enumerate(self.test_data):
-    #             test_true.extend(y.tolist())
-    #
-    #             out = self.model.eval_forward(x.to(self.device), samples=samples)
-    #             out = torch.softmax(out, -1).mean(0)
-    #             out = out.argmax(dim=-1)
-    #             test_pred.extend(out.tolist())
-    #
-    #     return test_true, test_pred
 
     def train_step(self, train_samples=1, test_samples=1, **kwargs):
         losses, train_res = self.train_epoch(samples=train_samples)

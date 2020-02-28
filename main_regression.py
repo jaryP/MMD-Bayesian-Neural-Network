@@ -2,6 +2,9 @@ import GPy
 import matplotlib.pyplot as plt
 import torch
 from torch.utils.data import Dataset
+import json
+import sys
+import numpy as np
 
 import ANN
 import DropoutNet
@@ -49,7 +52,7 @@ def get_dataset(batch_size, regression_points, points_range, variance, noise):
     C = k.K(x, x) + np.eye(x.shape[0]) * (x) ** 2 * noise ** 2
 
     y = np.random.multivariate_normal(np.zeros(x.shape[0]), C)[:, None]
-    y = (y - y.mean())  # + np.random.normal(scale=noise, size=y.shape)
+    y = (y - y.mean())
 
     test_idx = np.concatenate((np.arange(0, regression_points // 2),
                            np.arange(regression_points // 2 + regression_points, regression_points * 2)))
@@ -76,7 +79,6 @@ def main(experiment):
     import BMMD
 
     import os
-    from enum import Enum
     import numpy as np
 
     torch.backends.cudnn.deterministic = True
@@ -163,16 +165,8 @@ def main(experiment):
         if epochs < 0:
             raise ValueError('The number of epoch should be > 0')
 
-        # if isinstance(experiments, int):
-        #     experiments = [experiments]
-
         if isinstance(seeds, int):
             seeds = [seeds]
-
-        # if isinstance(experiments, list):
-        #     if (not isinstance(seeds, list)) or (isinstance(seeds, list) and len(experiments) != len(seeds)):
-        #         raise ValueError('The number of the experiments and the number of seeds needs to match, '
-        #                          'given: {} and {}'.format(experiments, seeds))
 
         if network not in NetworkTypes:
             raise ValueError('Supported networks', NetworkTypes)
@@ -207,8 +201,6 @@ def main(experiment):
                 optimizer = torch.optim.RMSprop
 
         run_results = []
-        local_rotate_res = []
-        local_ettack_res = []
 
         if not os.path.exists(save_path):
             os.makedirs(save_path)
@@ -238,8 +230,6 @@ def main(experiment):
             # print([(n, p.device) for n, p in model.named_parameters()])
             opt = optimizer(model.parameters(), lr=lr)
 
-            current_path = os.path.join(save_path, exp_name)  # , str(e))
-
             results = {}
             epoch_start = 0
 
@@ -254,7 +244,6 @@ def main(experiment):
                 progress_bar.set_postfix(loss=np.mean(loss))
 
             with torch.no_grad():
-                # dist = int(np.abs(points_range[0] - points_range[1]) / 4)
                 dist = np.abs(points_range[0] - points_range[1]) // 2
                 x_true = torch.linspace(points_range[0] - dist, points_range[1] + dist, 500)
                 pred = t.model.eval_forward(x_true[:, None].to(device), samples=test_samples)
@@ -291,14 +280,11 @@ def main(experiment):
             plt.plot(x_true, y_pred, linewidth=0.8)
             offset = np.abs(mn - mx) * 0.1
 
-            print(mx, mn)
             plt.ylim(mn - offset, mx + offset)
             plt.xlim(np.min(x_true), np.max(x_true))
 
             plt.grid(True, alpha=0.2)
 
-            # plt.xticks(fontsize=15)
-            # plt.yticks(fontsize=17)
 
             plt.xlabel('x')
             plt.ylabel('y')
@@ -312,85 +298,13 @@ def main(experiment):
         print('-' * 200)
         experiments_results.append(run_results)
 
-        # f1 = results['test_results']
-        # plt.plot(range(len(f1)), f1, label=label)
-        # plt.legend()
-        # print(f1)
-
-    # plt.show()
-
-    # fig, ax = plot_test(experiments, rotation_results)
-    # for a in ax:
-    #     a.set_xticklabels(['']+ANN.Trainer.rotations)
-    # # fig.draw()
-    # fig.savefig(os.path.join(save_path, "rotation.pdf"), bbox_inches='tight')
-    # plt.close(fig)
-    #
-    # fig, ax = plot_test(experiments, adversarial_attack_results)
-    # for a in ax:
-    #     a.set_xticklabels(['']+ANN.Trainer.epsilons)
-    # fig.savefig(os.path.join(save_path, "fgsa.pdf"), bbox_inches='tight')
-    # plt.close(fig)
-
-    # plt.figure(0)
-    # for d, r in zip(experiments, experiments_results):
-    #     res = [i['test_results'][1:] for i in r]
-    #     res = 100 - np.asarray(res)*100
-    #
-    #     # print(res.shape, res.mean(0), res.std(0))
-    #     means = res.mean(0)
-    #     stds = res.std(0)
-    #
-    #     f1 = means
-    #
-    #     plt.plot(range(len(f1)), f1, label=d.get('label', d['network_type']), c=d['color'])
-    #
-    #     plt.fill_between(range(len(f1)), f1 - stds, f1 + stds, alpha=0.1, color=d['color'])
-    #
-    #     plt.legend()
-    #
-    #     # print(f1)
-    # # plt.ylim(0.95, 1)
-    #
-    # plt.ylabel("Error test (%)")
-    # plt.xlabel("Epochs")
-    # plt.savefig(os.path.join(save_path, "score.pdf"), bbox_inches='tight')
-
     return experiments_results
 
 
 if __name__ == '__main__':
-    import json
-    import sys
-    import numpy as np
-
     args = sys.argv[1:]
 
     with open(args[0], "r") as read_file:
         experiments = json.load(read_file)
 
-    # print(len(experiments))
     results = main(experiments)
-
-    # fig = plt.figure()
-    # for d, r in zip(experiments, results):
-    #     res = [i['test_results'][1:] for i in r]
-    #     res = np.asarray(res)
-    #
-    #     # print(res.shape, res.mean(0), res.std(0))
-    #     means = res.mean(0)
-    #     stds = res.std(0)
-    #
-    #     f1 = means
-    #
-    #     plt.plot(range(len(f1)), f1, label=d.get('label'))
-    #
-    #     plt.fill_between(range(len(f1)), f1 - stds, f1 + stds, alpha=0.3)
-    #
-    #     plt.legend()
-    #     # print(f1)
-    # # plt.ylim(0.95, 1)
-    #
-    # plt.ylabel("Error test (%)")
-    # plt.xlabel("Epochs")
-    # plt.show()

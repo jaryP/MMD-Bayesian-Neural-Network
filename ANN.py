@@ -1,11 +1,8 @@
-from itertools import chain
-
 import torch
-from torch import nn
 from tqdm import tqdm
 
-from base import Network, Wrapper, get_network, log_gaussian_loss, \
-    cross_entropy_loss
+from base import Wrapper, get_network, log_gaussian_loss, \
+    cross_entropy_loss, Network
 
 
 class ANN(Network):
@@ -16,9 +13,6 @@ class ANN(Network):
             topology = [400, 400]
 
         self.features = get_network(topology, sample, classes)
-
-        # self.regression = regression
-        # self.classes = classes
 
     def forward(self, x, **kwargs):
         for j, i in enumerate(self.features):
@@ -31,7 +25,7 @@ class ANN(Network):
 
 
 class Trainer(Wrapper):
-    def __init__(self, model: ANN, train_data, test_data, optimizer):
+    def __init__(self, model: ANN, train_data, test_data, optimizer, **kwargs):
         super().__init__(model, train_data, test_data, optimizer)
 
         self.regression = model.regression
@@ -45,7 +39,6 @@ class Trainer(Wrapper):
 
         self.model.train()
         progress_bar = tqdm(enumerate(self.train_data), total=len(self.train_data), disable=False, leave=False)
-        # progress_bar.set_postfix(mmd_loss='not calculated', ce_loss='not calculated')
 
         train_true = []
         train_pred = []
@@ -110,78 +103,3 @@ class Trainer(Wrapper):
             noises = self.model.noise.exp().item()
 
         return x_all, y_all, pred, noises
-
-    def snr_test(self, percentiles: list):
-        return None
-
-    # def rotation_test(self, **kwargs):
-    #     ts_copy = copy(self.test_data.dataset.transform)
-    #
-    #     HS = []
-    #     scores = []
-    #     self.model.eval()
-    #
-    #     for angle in self.rotations:
-    #         ts = T.Compose([AngleRotation(angle), ts_copy])
-    #         self.test_data.dataset.transform = ts
-    #
-    #         H = []
-    #         pred_label = []
-    #         true_label = []
-    #
-    #         self.model.eval()
-    #         with torch.no_grad():
-    #             for i, (x, y) in enumerate(self.test_data):
-    #                 true_label.extend(y.tolist())
-    #
-    #                 out = self.model.eval_forward(x.to(self.device))
-    #                 pred_label.extend(out.argmax(dim=-1).tolist())
-    #
-    #                 H.extend(compute_entropy(F.softmax(out, -1)).tolist())
-    #
-    #         HS.append(np.mean(H))
-    #
-    #         scores.append(metrics.f1_score(true_label, pred_label, average='micro'))
-    #
-    #     self.test_data.dataset.transform = ts_copy
-    #     return HS, scores
-    #
-    # def attack_test(self, **kwargs):
-    #     HS = []
-    #     scores = []
-    #     self.model.eval()
-    #
-    #     for eps in self.epsilons:
-    #
-    #         H = []
-    #         pred_label = []
-    #         true_label = []
-    #
-    #         # self.model.eval()
-    #         for i, (x, y) in enumerate(self.test_data):
-    #             true_label.extend(y.tolist())
-    #
-    #             x = x.to(self.device)
-    #
-    #             self.model.zero_grad()
-    #             x.requires_grad = True
-    #             out = self.model(x)
-    #             pred = (out.argmax(dim=-1) == y).tolist()
-    #
-    #             loss = F.cross_entropy(out, y.to(self.device), reduction='mean')
-    #             loss.backward()
-    #
-    #             perturbed_data = fgsm_attack(x, eps)
-    #             out = self.model(perturbed_data)
-    #
-    #             pred_label.extend(out.argmax(dim=-1).tolist())
-    #             a = compute_entropy(F.softmax(out, -1), True).tolist()
-    #
-    #             H.extend(compute_entropy(F.softmax(out, -1)).tolist())
-    #             H.extend([a[i] for i in range(len(a)) if pred[i] == 0])
-    #
-    #         scores.append(metrics.f1_score(true_label, pred_label, average='micro'))
-    #         HS.append(np.mean(H))
-    #
-    #     return HS, scores
-    #

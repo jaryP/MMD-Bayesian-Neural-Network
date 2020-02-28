@@ -41,8 +41,8 @@ class BayesianLayer(ABC, nn.Module):
     def _mmd_forward(self, x, calculate_divergence):
         o, w, b = self._forward(x)
 
-        mmd_w = torch.tensor(0.0).to(x.device)  # .float()
-        mmd_b = torch.tensor(0.0).to(x.device)  # .float()
+        mmd_w = torch.tensor(0.0).to(x.device)
+        mmd_b = torch.tensor(0.0).to(x.device)
 
         if self.training and calculate_divergence:
             w = torch.flatten(w, 1)

@@ -7,11 +7,9 @@ class Gaussian(object):
         self.mu = mu
         self.sigma = sigma
         self.inner_gaussian = Normal(mu, sigma)
-        # self.gaussian = torch.distributions.Normal(mu, sigma)
 
     def sample(self, size):
         return self.inner_gaussian.rsample(size)
-        # return self.mu + self.sigma * Normal(0, 1).sample(size)
 
     def log_prob(self, x):
         return self.inner_gaussian.log_prob(x)
@@ -25,7 +23,6 @@ class Laplace(object):
 
     def sample(self, size):
         return self.distribution.rsample(size)
-        # return self.mu + self.sigma * Normal(0, 1).sample(size)
 
     def log_prob(self, x):
         return self.distribution.log_prob(x)
@@ -50,7 +47,6 @@ class ScaledMixtureGaussian(object):
 
 class Uniform:
     def __init__(self, a, b):
-        # self.dist = torch.distributions.uniform.Uniform(torch.tensor([float(a)]), torch.tensor([float(b)]))
         self.dist = torch.distributions.uniform.Uniform(a, b)
 
     def sample(self, size):

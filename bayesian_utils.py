@@ -49,33 +49,25 @@ class BayesianParameters(nn.Module):
                 rho_size = list(size)
                 for i in range(1, len(rho_size)):
                     rho_size[i] = 1
-                    #   rho_size = (size[0], 1)
 
         if rho_initialization is None:
             rho = torch.randn(rho_size)
-            # self.rho = nn.Parameter(torch.randn(rho_size), requires_grad=True)
         else:
             t = rho_initialization['type']
 
             if t == 'uniform':
                 a, b = rho_initialization['a'], rho_initialization['b']
                 rho = torch.zeros(rho_size).uniform_(a, b)
-                # self.rho = nn.Parameter(torch.zeros(rho_size).uniform_(a, b), requires_grad=True)
             elif t == 'gaussian':
                 mu, sigma = rho_initialization['mu'], rho_initialization['sigma']
                 rho = torch.zeros(rho_size).normal_(mu, sigma)
-                # self.rho = nn.Parameter(torch.zeros(rho_size).normal_(mu, sigma), requires_grad=True)
             elif t == 'constant':
                 rho = torch.ones(rho_size) * rho_initialization['c']
-                # self.rho = nn.Parameter(torch.ones(rho_size) * rho_initialization['c'], requires_grad=True)
             else:
                 raise ValueError("Pissible initialization for rho parameter: \n"
                                  "-gaussian {{mu, sigma}}\n"
                                  "-uniform {{a, b}}\n"
                                  "-constant {{c}}. \n {} was given".format(t))
-
-        # if posterior_type != 'weights':
-        #     rho = rho/self.mu.pow(2).data
 
         self.rho = nn.Parameter(rho, requires_grad=True)
 
@@ -189,33 +181,7 @@ def compute_mmd(x, y, type='inverse', biased=True, space=None, max=False):
     else:
         XX = XX.sum() - XX.trace()
         YY = YY.sum() - YY.trace()
-        XY = XY.sum()  # - XY.trace()
+        XY = XY.sum()
         mmd = (1 / (xs ** 2)) * XX + (1 / (xs ** 2)) * YY - (2 / (xs * xs)) * XY
 
-    # return torch.sqrt(F.relu(mmd))
-    # return torch.sqrt(torch.abs(mmd))
     return F.relu(mmd)
-    # return torch.sqrt(torch.abs(mmd))
-
-
-if __name__ == '__main__':
-    torch.manual_seed(10)
-    k = 'inverse'
-    mmds = []
-    for i in range(100):
-        x = torch.randn([100, 1])  # * 0.1
-        y = torch.randn([100, 1])  # * 0.1 + 10
-
-        a = compute_mmd(x, y, k, biased=True)
-        mmds.append(a.item())
-    torch.manual_seed(10)
-
-    mmds_u = []
-    for i in range(100):
-        x = torch.randn([100, 1])  # * 0.1
-        y = torch.randn([100, 1])  # * 0.1 + 10
-
-        a = compute_mmd(x, y, k, biased=False)
-        mmds_u.append(a.item())
-
-    print(np.mean(mmds), np.mean(mmds_u))

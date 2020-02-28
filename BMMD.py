@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from base import Network, Wrapper, get_bayesian_network
+from base import Wrapper, get_bayesian_network, Network
 from priors import Gaussian
 from bayesian_layers import BayesianCNNLayer, BayesianLinearLayer
 
@@ -27,9 +27,6 @@ class BMMD(Network):
         self.features = get_bayesian_network(topology, sample, classes,
                                              mu_init, rho_init, prior, 'mmd', local_trick, posterior_type, bias=True,
                                              **kwargs)
-
-        # ##################### non abbandonarmi più jary!!!!
-        # ##################### Scusa :'(
 
     def _forward(self, x):
 
@@ -64,8 +61,18 @@ class BMMD(Network):
 
 
 class Trainer(Wrapper):
-    def __init__(self, model: nn.Module, train_data, test_data, optimizer):
+    def __init__(self, model: nn.Module, train_data, test_data, optimizer, wd=None):
         super().__init__(model, train_data, test_data, optimizer)
+        self.wd = wd
+
+    def weight_normalization_loss(self):
+        l2_reg = torch.tensor(0.).to(self.device)
+        for j, i in enumerate(self.model.features):
+            if isinstance(i, (BayesianLinearLayer, BayesianCNNLayer)):
+                l2_reg += torch.norm(i.w.weights)
+                if i.b is not None:
+                    l2_reg += torch.norm(i.b.weights)
+        return l2_reg
 
     def train_epoch(self, samples=1, **kwargs):
         losses = []
@@ -95,12 +102,9 @@ class Trainer(Wrapper):
             self.optimizer.zero_grad()
 
             out, mmd = self.model(x, samples=samples)
-            # out = out.mean(0)
 
             mmd *= mmd_w
-            # mmd /= x.shape[0]
             mmd *= pi[batch]
-            # mmd *= 1/M
 
             if pi[batch] == 0:
                 self.model.calculate_mmd = False
@@ -123,6 +127,10 @@ class Trainer(Wrapper):
 
             tot_loss = mmd + loss
 
+            if self.wd is not None:
+                reg = self.weight_normalization_loss() * self.wd
+                tot_loss += reg
+
             losses.append(tot_loss.item())
             tot_loss.backward()
 
@@ -136,6 +144,3 @@ class Trainer(Wrapper):
         losses, train_res = self.train_epoch(samples=train_samples, **kwargs)
         test_res = self.test_evaluation(samples=test_samples, **kwargs)
         return losses, train_res, test_res
-
-    def snr_test(self, percentiles: list):
-        return None
